@@ -14,7 +14,7 @@
 #   2. “ARTICLE INFO” disappearing after code refactors
 # ------------------------------------------------------------
 import fitz, statistics, json, re
-from   typing import List, Tuple
+from   typing import List, Tuple, Any
 
 # ──────── layout constants ───────────────────────────────────
 COL_FACTOR   = 1.0          # min. column gap  = 1.0 × char‑width
@@ -29,52 +29,242 @@ BBox = Tuple[float, float, float, float]               # helper alias
 print(fitz.__doc__.split()[1])  
 
 # ───────────────── table helpers ─────────────────────────────
-def find_tables_fast(page: fitz.Page) -> List["fitz.Table"]:
-    print(">>> scanning tables on page", page.number+1)
-    for strategy, tol in (("lines", 14), ("structure", None)):
-        try:
-            if strategy == "lines":
-                tf = page.find_tables(strategy=strategy,
-                                      intersection_tolerance=tol)
-            else:                       # structure: no intersection tol.
-                tf = page.find_tables(strategy=strategy)
-            print("   strategy", strategy, "→", len(tf.tables) if tf else 0)
-            if tf and tf.tables:
-                return tf.tables
-        except Exception:
-            pass
-    return []
+# ───────────────────────────────────────────────────────────────
+#  Fallback ruled‑table detector that works on PyMuPDF 1.26.1
+# ───────────────────────────────────────────────────────────────
+# ───────────────────────── ruled‑grid detector ──────────────────────
+# ───────────────────────── ruled‑grid detector ──────────────────────
+# ───────────────────────────────── ruled‑grid detector ─────────────────────────
+# ───────────────────────────────── ruled‑grid detector ─────────────────────────
+def find_tables_fast(page) -> list[Any]:
+    """
+    1.  Run MuPDF’s built‑in ruled‑table detector (“lines” strategy).
+    2.  If it returns nothing (thin rules are common in publisher PDFs),
+        • collect horizontal path segments from page.get_text("dict")
+          – these are already flattened, so they include rules drawn
+          inside Form‑XObjects even in PyMuPDF 1.26.1;
+        • take the uppermost and lowermost long segments as a frame;
+        • bucket the words inside that frame into rows / columns.
+    The function returns either real fitz.Table objects or one
+    pseudo‑Table with the same interface (.bbox, .row_count, .col_count,
+    .extract()) so the rest of the pipeline can stay unchanged.
+    """
 
-def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> List[List[str]]:
-    try:                               # MuPDF built‑in extractor
-        return tbl.extract()
-    except Exception:
-        pass
-    
-    x0, y0, x1, y1 = tbl.bbox
+    DEBUG = True           # ← turn verbose diagnostics on / off
+
+    def _horiz_segments(min_len=80, y_tol=1.0):
+        """
+        Return a list of (x0, y0, x1, y1) tuples for every *vector*
+        horizontal segment at least `min_len` pt long.
+        Works on PyMuPDF 1.26.1.  Tries `page.get_drawings()` first because
+        that API always lists Form‑XObject content; falls back to
+        get_text('dict') only when absolutely necessary.
+        """
+        segs = []
+
+        for path in page.get_drawings():              # ≤1.26: no args
+            r = path["rect"]                          # bounding box
+            if r.height <= y_tol and r.width >= min_len:
+                y = r.y0                              # thin → treat as line
+                segs.append((r.x0, y, r.x1, y))
+
+        if not segs:
+            tdict = page.get_text("dict")
+            for blk in tdict.get("blocks", []):
+                if blk.get("type") != 4:
+                    continue
+                for item in blk.get("items", []):
+                    cmd = item[0]
+                    if cmd == "l":
+                        (x0, y0), (x1, y1) = item[1]
+                        if abs(y1 - y0) <= y_tol and (x1 - x0) >= min_len:
+                            segs.append((x0, y0, x1, y1))
+                    elif cmd == "re":
+                        x0, y0, x1, y1 = item[1]
+                        if (x1 - x0) >= min_len:
+                            segs.append((x0, y0, x1, y0))
+                            segs.append((x0, y1, x1, y1))
+
+        if DEBUG:
+            import sys
+            print(f"   horiz segments ≥{min_len}px: {len(segs)}",
+                  file=sys.stderr)
+            for s in segs[:10]:
+                print(f"      y={s[1]:.1f}  x0={s[0]:.1f} x1={s[2]:.1f}",
+                      file=sys.stderr)
+
+        return segs
+
+    # ---------- 1) MuPDF native detector ------------------------------
+    native = page.find_tables(strategy="lines", intersection_tolerance=14)
+    if native and native.tables:
+        if DEBUG:
+            import sys
+            print(f"[page {page.number+1}] native tables: {len(native.tables)}",
+                  file=sys.stderr)
+        return native.tables                    # ← best quality
+
+    # ---------- 2) ruled‑frame fallback -------------------------------
+    if DEBUG:
+        import sys
+        print(f"[page {page.number+1}] native detector found nothing",
+              file=sys.stderr)
+
+    hlines = _horiz_segments()
+    if len(hlines) < 2:
+        if DEBUG:
+            import sys
+            print("   not enough horizontals → abort", file=sys.stderr)
+        return []
+
+    # longest horizontal at top & bottom
+    top = min(hlines, key=lambda s: (s[1], -(s[2] - s[0])))
+    bot = max(hlines, key=lambda s: (s[1],  (s[2] - s[0])))
+    x0, y0, x1, y1 = top[0], top[1], top[2], bot[1]
+
+    if DEBUG:
+        import sys
+        print(f"   frame y0={y0:.1f} y1={y1:.1f} h={y1-y0:.1f} "
+              f"w={x1-x0:.1f}", file=sys.stderr)
+
+    if (y1 - y0) < 40 or (x1 - x0) < 250:
+        if DEBUG:
+            import sys
+            print("   frame too small → reject", file=sys.stderr)
+        return []
+
+    # gather words inside frame
     words = [w for w in page.get_text("words")
-             if x0 <= 0.5*(w[0]+w[2]) <= x1 and y0 <= 0.5*(w[1]+w[3]) <= y1]
+             if x0 <= (w[0] + w[2]) * 0.5 <= x1
+             and y0 <= (w[1] + w[3]) * 0.5 <= y1]
+    if DEBUG:
+        import sys
+        print(f"   words inside frame: {len(words)}", file=sys.stderr)
     if not words:
         return []
-    words.sort(key=lambda w: (round(w[1], 1), w[0]))
-    rows, cur, cur_y = [], [], None
+
+    # infer columns
+    xs = sorted(set(round(w[0], 1) for w in words))
+    col_starts = [xs[0]]
+    for a, b in zip(xs, xs[1:]):
+        if b - a >= 40:
+            col_starts.append(b)
+    col_starts.append(x1)
+    if DEBUG:
+        import sys
+        print(f"   column starts ({len(col_starts)-1}): {col_starts[:-1]}",
+              file=sys.stderr)
+
+    # ─── reject frames that are almost certainly NOT tables ────────────
+    # 1) only one real column detected   → looks like plain text
+    if len(col_starts) <= 2:            # note: sentinel makes it “2”
+        if DEBUG:
+            print("   only one inferred column → reject", file=sys.stderr)
+        return []
+
+    # 2) top & bottom horizontals must span (almost) the same width
+    EPS = 5.0
+    same_span = abs(top[0] - bot[0]) <= EPS and abs(top[2] - bot[2]) <= EPS
+    if not same_span:
+        if DEBUG:
+            print("   frame edges have different spans → reject", file=sys.stderr)
+        return []
+    # -------------------------------------------------------------------
+    
+    # build rows
+    rows_map = {}
     for w in words:
-        yy = round(w[1], 1)
-        if cur_y is None or abs(yy-cur_y) > 2:
-            if cur:
-                rows.append([" ".join(cur)])
-            cur, cur_y = [w[4]], yy
+        mid_y = round(w[1], 1)
+        for c in range(len(col_starts) - 1):
+            if col_starts[c] <= w[0] < col_starts[c + 1]:
+                rows_map.setdefault(mid_y, [""] * (len(col_starts) - 1))
+                cell = rows_map[mid_y][c]
+                rows_map[mid_y][c] = (cell + " " + w[4]).strip()
+                break
+
+    rows = [rows_map[k] for k in sorted(rows_map)]
+    if DEBUG:
+        import sys
+        print(f"   built {len(rows)} rows", file=sys.stderr)
+
+    # fabricate pseudo‑Table
+    class _PseudoTable:
+        def __init__(self, bbox, rows):
+            self.bbox = bbox
+            self.row_count = len(rows)
+            self.col_count = max(len(r) for r in rows)
+            self._rows = rows
+        def extract(self):
+            return self._rows
+
+    return [_PseudoTable((x0, y0, x1, y1), rows)]
+
+def tight_bbox_from_cells(t: "fitz.Table") -> tuple[float, float, float, float]:
+    xs0, ys0, xs1, ys1 = [], [], [], []
+    for row in (t.cells or []):
+        for cell in (row or []):
+            if cell is None:
+                continue               # empty or spanned‑over slot
+            x0, y0, x1, y1 = cell.bbox
+            xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+    if not xs0:
+        return t.bbox                  # fallback
+    return min(xs0), min(ys0), max(xs1), max(ys1)
+
+# ─────────────────────────────────────────────────────────────
+#  Utility: return textual rows for either a real fitz.Table
+#  or the pseudo‑Table you fabricate in find_tables_fast()
+# ─────────────────────────────────────────────────────────────
+def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
+    """
+    1. Try the native PyMuPDF extractor (works for *true* fitz.Table).
+    2. If that fails we rebuild the rows from the words that fall
+       inside tbl.bbox – this also works for the pseudo‑tables the
+       fallback detector creates.
+    """
+    # --- 1) built‑in --------------------------------------------------
+    try:
+        return tbl.extract()          # will succeed on native tables
+    except Exception:
+        pass
+
+    # --- 2) word‑based fallback --------------------------------------
+    x0, y0, x1, y1 = tbl.bbox
+    words = [w for w in page.get_text("words")
+             if x0 <= 0.5*(w[0]+w[2]) <= x1 and
+                y0 <= 0.5*(w[1]+w[3]) <= y1]
+
+    if not words:
+        return []
+
+    # sort by reading order
+    words.sort(key=lambda w: (round(w[1], 1), w[0]))
+
+    rows, cur_row, cur_y = [], [], None
+    for w in words:
+        y = round(w[1], 1)
+        if cur_y is None or abs(y - cur_y) > 2:   # new line
+            if cur_row:
+                rows.append(cur_row)
+            cur_row, cur_y = [w[4]], y
         else:
-            cur.append(w[4])
-    if cur:
-        rows.append([" ".join(cur)])
-    return rows
+            cur_row.append(w[4])
+
+    if cur_row:
+        rows.append(cur_row)
+
+    # split the “cells” on two or more consecutive spaces so that
+    # tabular layouts produced with fixed‑width fonts don’t come out
+    # as one huge string (optional, but helps on publisher PDFs)
+    split_on = re.compile(r'\s{2,}')
+    return [split_on.split(" ".join(r).strip()) for r in rows]
+
 
 def table_feature_dict(page: fitz.Page, tbl: "fitz.Table", pno: int) -> dict:
     rows = rows_from_table(page, tbl)
     return {
         "type":    "table",
-        "page":    pno,
+        "page":    pno + 1,
         "bbox":    [round(v, 2) for v in tbl.bbox],
         "row_cnt": len(rows),
         "col_cnt": max((len(r) for r in rows), default=0),
