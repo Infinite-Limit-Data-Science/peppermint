@@ -480,6 +480,28 @@ def segment_page(page, min_block_width_frac: float = 0.0) -> list[dict]:
     foot_idx       = [i for i in idx if lines[i]["y0"] >= bot_band]
     body_idx       = [i for i in idx if i not in head_idx + foot_idx]
 
+
+    def median_font(idx_list):
+        fonts = [lines[i]["size"] for i in idx_list if lines[i]["text"].strip()]
+        return statistics.median(fonts) if fonts else 0
+
+    # ── merge header back into body when it is probably not a header ──
+    if head_idx and body_idx:
+        head_last_y  = max(lines[i]["y1"] for i in head_idx)
+        body_first_y = min(lines[i]["y0"] for i in body_idx)
+
+        close_enough = (body_first_y - head_last_y) < ROW_FACTOR * line_h
+
+        head_font = median_font(head_idx)
+        body_font = median_font(body_idx)
+        same_font = abs(head_font - body_font) <= FONT_TOL
+
+        if close_enough and same_font:
+            body_idx += head_idx
+            head_idx  = []
+    # ------------------------------------------------------------------
+
+
     # ----------------- tables (only for *masking* stats) --------
  
     # ----------------- XY‑cut on each zone ----------------------
@@ -582,7 +604,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf")
+                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf") # "" 2025Centene.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
