@@ -259,9 +259,38 @@ def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
     split_on = re.compile(r'\s{2,}')
     return [split_on.split(" ".join(r).strip()) for r in rows]
 
+def _compress_columns(rows, min_populated=2):
+    """
+    Remove columns that have fewer than `min_populated` non‑empty cells.
+    Returns a new list of rows.
+    """
+    if not rows:
+        return rows
+
+    # count non‑empty cells per column
+    max_cols = max(len(r) for r in rows)
+    counts   = [0] * max_cols
+    for r in rows:
+        for j, cell in enumerate(r):
+            if j < max_cols and cell and str(cell).strip():
+                counts[j] += 1
+
+    keep = [j for j, c in enumerate(counts) if c >= min_populated]
+    if len(keep) == max_cols:          # nothing to drop
+        return rows
+
+    # rebuild rows with kept columns only
+    new_rows = [[ (r[j] if j < len(r) else None) for j in keep ]
+                for r in rows]
+
+    # optional: drop rows that became all‑empty
+    new_rows = [r for r in new_rows if any(cell and str(cell).strip() for cell in r)]
+    return new_rows
 
 def table_feature_dict(page: fitz.Page, tbl: "fitz.Table", pno: int) -> dict:
     rows = rows_from_table(page, tbl)
+    rows = _compress_columns(rows, min_populated=2)
+    
     return {
         "type":    "table",
         "page":    pno + 1,
@@ -604,10 +633,10 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf") # "" 2025Centene.pdf
+                            "25M06-02C.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
     result = [{"page": p+1, "blocks": segment_page(doc.load_page(p))}
               for p in pages]
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False, indent=2)) 
