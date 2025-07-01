@@ -433,9 +433,6 @@ def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
     thresh_rel = 2.5 * med_gap if med_gap else 0
     return g >= max(thresh_abs, thresh_rel)
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Helper – detect a *horizontal* whitespace band (“Y‑gap”) inside a region
-# ──────────────────────────────────────────────────────────────────────────────
 def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
     """
     Look for a mostly empty horizontal stripe between the rows in *idx*.
@@ -452,9 +449,9 @@ def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
     if h <= 0 or line_h == 0:
         return None
 
-    BIN_HEIGHT = 1                       # 1‑pt vertical resolution
+    BIN_HEIGHT = 1
     bins = int(h // BIN_HEIGHT) + 1
-    hist = [0] * bins                    # “how many rows touch this bin?”
+    hist = [0] * bins
 
     for i in idx:
         y0 = max(lines[i]["y0"], ry0); y1 = min(lines[i]["y1"], ry1)
@@ -463,7 +460,7 @@ def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
         for b in range(b0, b1 + 1):
             hist[b] += 1
 
-    max_occ = max(1, int(tol * len(idx)))          # ≤2 % noisy pixels allowed
+    max_occ = max(1, int(tol * len(idx)))
     run_req = max(1, int((ROW_FACTOR * line_h) // BIN_HEIGHT))
 
     best = None; cur = None
@@ -497,7 +494,6 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
         A list of “leaf” segments, each being the list of row indices
         that belong to one output text block.
     """
-    # ── trivial cases ────────────────────────────────────────────────────────
     if not idx or len(idx) == 1:
         return [idx]
 
@@ -562,7 +558,6 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height))
 
-    # ── 3) fallback: largest line‑to‑line gap (unchanged) ───────────────────
     by_top   = sorted(idx, key=lambda i: lines[i]["y0"])
     med_font = statistics.median(lines[i]["size"] for i in idx)
 
