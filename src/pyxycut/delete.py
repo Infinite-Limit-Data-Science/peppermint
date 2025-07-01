@@ -433,15 +433,75 @@ def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
     thresh_rel = 2.5 * med_gap if med_gap else 0
     return g >= max(thresh_abs, thresh_rel)
 
-def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
-                  min_block_width=0.02):
-    
-    if not idx:
-        return []
+# ──────────────────────────────────────────────────────────────────────────────
+#  Helper – detect a *horizontal* whitespace band (“Y‑gap”) inside a region
+# ──────────────────────────────────────────────────────────────────────────────
+def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
+    """
+    Look for a mostly empty horizontal stripe between the rows in *idx*.
 
-    if len(idx) == 1:
+    Returns
+    -------
+    Optional[Tuple[float, float]]
+        (gy0, gy1) – top & bottom Y of the gap in page coordinates –  
+        or None if no sufficiently wide / clean stripe exists.
+    """
+    ry0 = min(lines[i]["y0"] for i in idx)
+    ry1 = max(lines[i]["y1"] for i in idx)
+    h   = ry1 - ry0
+    if h <= 0 or line_h == 0:
+        return None
+
+    BIN_HEIGHT = 1                       # 1‑pt vertical resolution
+    bins = int(h // BIN_HEIGHT) + 1
+    hist = [0] * bins                    # “how many rows touch this bin?”
+
+    for i in idx:
+        y0 = max(lines[i]["y0"], ry0); y1 = min(lines[i]["y1"], ry1)
+        b0 = int((y0 - ry0) // BIN_HEIGHT)
+        b1 = int((y1 - ry0) // BIN_HEIGHT)
+        for b in range(b0, b1 + 1):
+            hist[b] += 1
+
+    max_occ = max(1, int(tol * len(idx)))          # ≤2 % noisy pixels allowed
+    run_req = max(1, int((ROW_FACTOR * line_h) // BIN_HEIGHT))
+
+    best = None; cur = None
+    for j, occ in enumerate(hist + [max_occ + 1]):
+        if occ <= max_occ:
+            cur = j if cur is None else cur
+        elif cur is not None:
+            run = j - cur
+            if run >= run_req and (best is None or run > best[2]):
+                best = (cur, j - 1, run)
+            cur = None
+
+    if not best:
+        return None
+    g0, g1, _ = best
+    return ry0 + g0 * BIN_HEIGHT, ry0 + g1 * BIN_HEIGHT + BIN_HEIGHT
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Main recursive XY‑cut
+# ──────────────────────────────────────────────────────────────────────────────
+def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
+                  *, min_block_width=0.02, min_block_height=0.02):
+    """
+    Split the region that consists of rows *idx* until no significant
+    vertical (column) **or** horizontal (paragraph) whitespace remains.
+
+    Returns
+    -------
+    List[List[int]]
+        A list of “leaf” segments, each being the list of row indices
+        that belong to one output text block.
+    """
+    # ── trivial cases ────────────────────────────────────────────────────────
+    if not idx or len(idx) == 1:
         return [idx]
 
+    # ── exclude rows that sit inside user‑supplied table boxes ──────────────
     def in_table(ln):
         cx = (ln["x0"] + ln["x1"]) / 2
         cy = (ln["y0"] + ln["y1"]) / 2
@@ -454,50 +514,83 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     if char_w == 0 or line_h == 0:
         return [idx]
 
+    # ── 1) try vertical split (classic XY‑cut) ──────────────────────────────
     gutter = find_vertical_gutter(lines, idx, page_w, char_w)
     if gutter:
         gx0, gx1 = gutter
         left  = [i for i in idx if lines[i]["x1"] <= gx0]
         right = [i for i in idx if lines[i]["x0"] >= gx1]
         bridge = [i for i in idx if i not in left and i not in right
-                    and lines[i]["x0"] < gx1 and lines[i]["x1"] > gx0]
-        if left and right:
+                  and lines[i]["x0"] < gx1 and lines[i]["x1"] > gx0]
+
+        if left and right:                                   # sane split?
             min_w = min_block_width * page_w
-            if min_block_width and (
-                (max(lines[i]["x1"] for i in left) -
-                 min(lines[i]["x0"] for i in left) < min_w) or
-                (max(lines[i]["x1"] for i in right) -
-                 min(lines[i]["x0"] for i in right) < min_w)):
-                gutter = None
-        else:
-            gutter = None
+            l_w   = max(lines[i]["x1"] for i in left) - min(lines[i]["x0"] for i in left)
+            r_w   = max(lines[i]["x1"] for i in right) - min(lines[i]["x0"] for i in right)
+            if l_w >= min_w and r_w >= min_w:
+                return (xy_cut_region(sorted(left,  key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height)
+                     + xy_cut_region(sorted(bridge,key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height)
+                     + xy_cut_region(sorted(right, key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height))
 
-        if gutter:
-            return (
-                xy_cut_region(sorted(left,  key=lambda i: lines[i]["y0"]),
-                              lines, page_w, page_h, tbl_boxes, min_block_width)
-              + xy_cut_region(sorted(bridge,key=lambda i: lines[i]["y0"]),
-                              lines, page_w, page_h, tbl_boxes, min_block_width)
-              + xy_cut_region(sorted(right, key=lambda i: lines[i]["y0"]),
-                              lines, page_w, page_h, tbl_boxes, min_block_width)
-            )
+    # ── 2) try *horizontal* split (new branch) ──────────────────────────────
+    hgap = find_horizontal_gap(lines, idx, page_h, line_h)
+    if hgap:
+        gy0, gy1 = hgap
+        upper = [i for i in idx if lines[i]["y1"] <= gy0]
+        lower = [i for i in idx if lines[i]["y0"] >= gy1]
 
+        if upper and lower:                                 # sane split?
+            min_h = min_block_height * page_h
+            u_h   = max(lines[i]["y1"] for i in upper) - min(lines[i]["y0"] for i in upper)
+            l_h   = max(lines[i]["y1"] for i in lower) - min(lines[i]["y0"] for i in lower)
+            if u_h >= min_h and l_h >= min_h:
+                return (xy_cut_region(sorted(upper, key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height)
+                     + xy_cut_region(sorted(lower, key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height))
+
+    # ── 3) fallback: largest line‑to‑line gap (unchanged) ───────────────────
     by_top   = sorted(idx, key=lambda i: lines[i]["y0"])
     med_font = statistics.median(lines[i]["size"] for i in idx)
-    gaps, mids = [], []
+
+    gaps = []
     for a, b in zip(by_top, by_top[1:]):
         g = gap(lines[a], lines[b])
 
+        # heading → boost gap artificially
         if looks_like_heading(lines[a], med_font) or looks_like_heading(lines[b], med_font):
             g = max(g, ROW_FACTOR * line_h + 1)
         gaps.append(g)
+
     med_gap = statistics.median(gaps) if gaps else 0
-    big = [k for k, g in enumerate(gaps) if is_large_gap(g, line_h, med_gap)]
+    big = [k for k, g in enumerate(gaps)
+           if is_large_gap(g, line_h, med_gap)]
+
     if big:
-        s = max(big, key=lambda k: gaps[k]) + 1
-        upper = by_top[:s]; lower = by_top[s:]
-        return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes, min_block_width) +
-                xy_cut_region(lower, lines, page_w, page_h, tbl_boxes, min_block_width))
+        split_pos = max(big, key=lambda k: gaps[k]) + 1
+        upper = by_top[:split_pos]
+        lower = by_top[split_pos:]
+        return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes,
+                              min_block_width=min_block_width,
+                              min_block_height=min_block_height)
+             + xy_cut_region(lower, lines, page_w, page_h, tbl_boxes,
+                              min_block_width=min_block_width,
+                              min_block_height=min_block_height))
+
+    # ── 4) nothing to cut – return the current region ──────────────────────
     return [idx]
 
 def make_output_chunk(seg: List[int], rows: List[Dict]) -> Dict:
@@ -551,7 +644,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "25M06-02C.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
+                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
