@@ -10,7 +10,38 @@ ROW_FACTOR   = 1.5
 BIN_WIDTH    = 1
 BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 
-def extract_physical_lines(page: fitz.Page) -> List[Dict]:
+def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
+    """
+    Return one dictionary **per physical baseline** on the page.
+
+    ── PDF text hierarchy handled here ─────────────────────────────
+    • Block  - PyMuPDF “paragraph-level” unit, inferred from layout.
+    • Line   - all glyphs that share the *same baseline* inside a block.
+               A single baseline can mix styles, so PyMuPDF breaks it
+               into multiple *spans* while keeping one common bbox.
+    • Span   - a consecutive run of glyphs that share identical font
+               family, size, style, colour, writing direction, etc.
+
+      ┌─ Example:  “The  quick  bold  brown  fox”
+      │            └────┬────────────────────────── same line/baseline
+      │                 │
+      │        regular-face span(s)      bold-face span
+      └─────────────────────────────────────────────────────────────
+
+    Because one line may contain several spans, we compute the line’s
+    *dominant* font size as the statistical mode of its span sizes
+    (most common size across all spans).  This baseline-level record
+    is later combined with word-level data for gap detection, bullets,
+    and XY-cut segmentation.
+
+    Returns
+    -------
+    List[Dict]
+        Each dict contains:
+        • bbox      - (x0, y0, x1, y1) of the line
+        • spans     - raw span list for debugging
+        • fontsize  - dominant font size (float, points)
+    """
     blocks = page.get_text("dict")["blocks"]
     lines = []
     for blk in blocks:
@@ -29,7 +60,55 @@ def extract_physical_lines(page: fitz.Page) -> List[Dict]:
     return lines
 
 
-def group_words_by_baseline(page: fitz.Page, y_tol: float = 0.5) -> Dict[float, List[Dict]]:
+def bucket_words_by_baseline(page: fitz.Page, y_tol: float = 0.5) -> Dict[float, List[Dict]]:
+    """
+    Group every *word* on the page into buckets keyed by a quantized baseline
+    (Y₀ coordinate).
+        - Look at every word on the page.
+        - PyMuPDF hands each word to you with its position: (left x, top y, right x, bottom y, text, …)
+        - Give each word a “line-ID”.
+
+    ── Source granularity ─────────────────────────────────────────────
+    Uses ``page.get_text("words")`` which yields one tuple **per word**:
+        (x0, y0, x1, y1, text, block_no, line_no, word_no)
+
+    ── What “baseline bucketing” means ───────────────────────────────
+    • Words whose top-left Y₀ differs by ≤ *y_tol* points are considered to
+      lie on the *same* physical baseline.   
+    • The key is ``round(y0 / y_tol) * y_tol`` – a small grid that absorbs
+      minor anti-aliasing / hinting noise.
+
+    ── Output structure ──────────────────────────────────────────────
+    {
+        baseline_y : [                                 # sorted left→right
+            {
+                "bbox"  : (x0, y0, x1, y1),            # word rectangle
+                "text"  : "The",
+                "x0"    : x0,                          # cached for speed
+                "x1"    : x1,
+                "height": y1 - y0
+            },
+            …
+        ],
+        …
+    }
+
+    This fast lookup table is later consumed by ``split_physical_line`` and
+    column / gutter logic that require precise word-level gaps on a given
+    baseline.
+
+    Parameters
+    ----------
+    page : fitz.Page
+        Page from which to extract word tuples.
+    y_tol : float, default 0.5 pt
+        Quantisation quantum for baseline grouping.
+
+    Returns
+    -------
+    Dict[float, List[Dict]]
+        Maps each quantised baseline to its left-to-right list of words.
+    """
     words = page.get_text("words")
     buckets: Dict[float, List[Dict]] = defaultdict(list)
     for w in words:
@@ -60,11 +139,65 @@ def char_widths(word_dicts: Iterable[Dict]) -> List[float]:
     return widths
 
 
-def split_physical_line(
+def split_baseline_into_chunks(
     line: Dict,
     line_words: List[Dict],
     gap_factor: float = 2.5,
 ) -> List[Dict]:
+    """
+    Break one **printed baseline** into smaller “logical rows” whenever a
+    *visually large* horizontal blank separates consecutive words.
+
+    Parameters
+    ----------
+    baseline_meta : Dict
+        The record produced by ``extract_baseline_lines`` for this baseline.
+        It already contains:
+            • bbox      – bounding-box for the *whole* baseline
+            • fontsize  – dominant font size on that baseline
+    words_on_baseline : List[Dict]
+        All word-level dicts that share this baseline, supplied by
+        ``bucket_words_by_baseline`` (each has x0, x1, bbox, text, …).  The
+        list **must be pre-sorted left→right**.
+    gap_factor : float, default 2.5
+        A horizontal gap is considered “large” if it is at least
+        ``gap_factor × median_character_width``.  Increase to split less,
+        decrease to split more aggressively.
+
+    Returns
+    -------
+    List[Dict]
+        Zero or more chunk dicts, each representing **one logical row**
+        printed on the same baseline but separated by a large gap.  Every
+        chunk contains:
+            • bbox      – union of its words
+            • text      – concatenation of its words with single spaces
+            • fontsize  – copied from *baseline_meta*
+            • baseline  – y-coordinate of this baseline (top of bbox)
+
+    Why this matters
+    ----------------
+    PDFs often place two semantically distinct items on the same baseline:
+
+        ▪ “• Apples       • Oranges”
+        ▪ “Name     Price”
+        ▪ “Premium:        $400”
+
+    Treating the entire baseline as one string would lose that structure.
+    By detecting unusually wide gaps (scaled by character width) we preserve
+    bullet lists, key-value pairs, and pseudo-columns for later layout
+    analysis.
+
+    Algorithm
+    ---------
+    1. Compute the median **character width** on this baseline:
+           w_char_med = median( (x1−x0)/len(text) for each word )
+    2. Define a threshold:
+           gap_threshold = gap_factor × w_char_med
+    3. Scan words left→right; whenever the white-space between *prev* and
+       *curr* (``curr.x0 − prev.x1``) ≥ gap_threshold, start a new chunk.
+    4. For every chunk, build the bounding box and join the text.
+    """
     if not line_words:
         return []
     
@@ -104,15 +237,15 @@ def split_and_tag_lines(page: fitz.Page) -> List[Dict]:
     Runs the full baseline → words mapping + sub‑line splitting.
     Adds field 'is_bullet_only' to each logical chunk.
     """
-    lines = extract_physical_lines(page)
-    word_buckets = group_words_by_baseline(page)
+    lines = extract_baseline_lines(page)
+    word_buckets = bucket_words_by_baseline(page)
 
     logical_rows = []
     for ln in lines:
         y0 = ln["bbox"][1]
         key = round(y0 / 0.5) * 0.5
         words_same_baseline = word_buckets.get(key, [])
-        chunks = split_physical_line(ln, words_same_baseline)
+        chunks = split_baseline_into_chunks(ln, words_same_baseline)
         for ck in chunks:
             ck["is_bullet_only"] = bool(BULLET_RE.fullmatch(ck["text"].strip()))
             logical_rows.append(ck)
@@ -190,6 +323,74 @@ def compute_dominant_sizes(lines: List[dict]) -> Tuple[float, float]:
     return char, statistics.median(core)
 
 def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
+    """
+    Detect a **mostly empty vertical stripe** (a “gutter”) inside the region
+    spanned by the rows indexed in *idx*.  Such a gutter is strong evidence
+    of a multi-column layout, and `xy_cut_region` will split on it before
+    attempting any horizontal cuts.
+
+    Parameters
+    ----------
+    lines : List[Dict]
+        All pre-processed row dictionaries for the current page (output of
+        `preprocess_page`).  Only geometry fields (`x0, x1`) are used here.
+    idx : List[int]
+        Indices of the rows that form the *current* rectangular region under
+        consideration.  We try to find a gutter **only inside this subset**.
+    page_w : float
+        Full page width, needed for a sanity check that prevents splitting
+        off unreasonably narrow columns.
+    char_w : float
+        Median character width for this region (obtained from
+        `compute_dominant_sizes`).  The minimum gutter width is scaled by
+        this value so “one character wide” on a small font is still accepted.
+    tol : float, default 0.02
+        Maximum fraction of rows that may *touch* the candidate gutter
+        (default 2 %).  Allows a few overhanging headlines or images without
+        cancelling the split.
+
+    Returns
+    -------
+    Optional[Tuple[float, float]]
+        `(gx0, gx1)` – left and right x-coordinates of the gutter in page
+        space – if a suitable stripe is found; otherwise `None`.
+
+    How the algorithm works
+    -----------------------
+    1. **Restrict the search** to the horizontal span that encloses all rows
+       in *idx* (`rx0 … rx1`).  Work entirely within that mini-rectangle.
+
+    2. **Discretise** that span into 1 pt-wide vertical bins
+       (`BIN_WIDTH = 1`).  For every row, mark all bins it overlaps.  The
+       result is a histogram `hist[b]` counting “how many rows touch this
+       bin?”
+
+    3. **Thresholds**  
+       • *max_occ* = `max(1, tol × len(idx))`  
+         → bins touched by no more than ~ 2 % of rows are “sufficiently
+         empty”.  
+       • *run_req* = `max(1, int(COL_FACTOR × char_w / BIN_WIDTH))`  
+         → the gutter must span at least one **character width** of empty
+         bins.
+
+    4. **Scan the histogram** looking for the *longest* consecutive run of
+       low-occupancy bins (≤ *max_occ*).  Store the best run.
+
+    5. **Return** the page-x coordinates of that run if it meets
+       *run_req*; else return `None`.
+
+    6. **Safety check in `xy_cut_region`**  
+       Even when a gutter is reported, the caller confirms both resulting
+       sub-regions are wider than `min_block_width × page_w` to avoid bogus
+       splits on accidental white-space.
+
+    Practical outcome
+    -----------------
+    For two-column documents, the gutter is the white channel between
+    columns; for key-value layouts it can be the wide gap after the keys.
+    Detecting it early lets XY-Cut recurse **left → middle-bridge → right**
+    instead of slicing horizontally first.
+    """
     rx0 = min(lines[i]["x0"] for i in idx)
     rx1 = max(lines[i]["x1"] for i in idx)
     w   = rx1 - rx0
