@@ -3,7 +3,7 @@ import fitz
 import statistics
 from statistics import median
 from collections import defaultdict
-from typing import List, Tuple, Dict, Iterable
+from typing import List, Tuple, Dict, Iterable, Any
 
 COL_FACTOR   = 1.0
 ROW_FACTOR   = 1.5
@@ -13,6 +13,243 @@ BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 xy_cut_region_depth = 0
 
 DEBUG = True
+
+def find_tables_fast(page) -> list[Any]:
+    DEBUG = True
+
+    def _horiz_segments(min_len=80, y_tol=1.0):
+        segs = []
+
+        for path in page.get_drawings():
+            r = path["rect"]
+            if r.height <= y_tol and r.width >= min_len:
+                y = r.y0
+                segs.append((r.x0, y, r.x1, y))
+
+        if not segs:
+            tdict = page.get_text("dict")
+            for blk in tdict.get("blocks", []):
+                if blk.get("type") != 4:
+                    continue
+                for item in blk.get("items", []):
+                    cmd = item[0]
+                    if cmd == "l":
+                        (x0, y0), (x1, y1) = item[1]
+                        if abs(y1 - y0) <= y_tol and (x1 - x0) >= min_len:
+                            segs.append((x0, y0, x1, y1))
+                    elif cmd == "re":
+                        x0, y0, x1, y1 = item[1]
+                        if (x1 - x0) >= min_len:
+                            segs.append((x0, y0, x1, y0))
+                            segs.append((x0, y1, x1, y1))
+
+        if DEBUG:
+            import sys
+            print(f"   horiz segments ≥{min_len}px: {len(segs)}",
+                  file=sys.stderr)
+            for s in segs[:10]:
+                print(f"      y={s[1]:.1f}  x0={s[0]:.1f} x1={s[2]:.1f}",
+                      file=sys.stderr)
+
+        return segs
+
+    # ---------- 1) MuPDF native detector ------------------------------
+    native = page.find_tables(strategy="lines", intersection_tolerance=14)
+    if native and native.tables:
+        if DEBUG:
+            import sys
+            print(f"[page {page.number+1}] native tables: {len(native.tables)}",
+                  file=sys.stderr)
+        return native.tables                    # ← best quality
+
+    # ---------- 2) ruled‑frame fallback -------------------------------
+    if DEBUG:
+        import sys
+        print(f"[page {page.number+1}] native detector found nothing",
+              file=sys.stderr)
+
+    hlines = _horiz_segments()
+    if len(hlines) < 2:
+        if DEBUG:
+            import sys
+            print("   not enough horizontals → abort", file=sys.stderr)
+        return []
+
+    # longest horizontal at top & bottom
+    top = min(hlines, key=lambda s: (s[1], -(s[2] - s[0])))
+    bot = max(hlines, key=lambda s: (s[1],  (s[2] - s[0])))
+    x0, y0, x1, y1 = top[0], top[1], top[2], bot[1]
+
+    if DEBUG:
+        import sys
+        print(f"   frame y0={y0:.1f} y1={y1:.1f} h={y1-y0:.1f} "
+              f"w={x1-x0:.1f}", file=sys.stderr)
+
+    if (y1 - y0) < 40 or (x1 - x0) < 250:
+        if DEBUG:
+            import sys
+            print("   frame too small → reject", file=sys.stderr)
+        return []
+
+    # gather words inside frame
+    words = [w for w in page.get_text("words")
+             if x0 <= (w[0] + w[2]) * 0.5 <= x1
+             and y0 <= (w[1] + w[3]) * 0.5 <= y1]
+    if DEBUG:
+        import sys
+        print(f"   words inside frame: {len(words)}", file=sys.stderr)
+    if not words:
+        return []
+
+    # infer columns
+    xs = sorted(set(round(w[0], 1) for w in words))
+    col_starts = [xs[0]]
+    for a, b in zip(xs, xs[1:]):
+        if b - a >= 40:
+            col_starts.append(b)
+    col_starts.append(x1)
+    if DEBUG:
+        import sys
+        print(f"   column starts ({len(col_starts)-1}): {col_starts[:-1]}",
+              file=sys.stderr)
+
+    # ─── reject frames that are almost certainly NOT tables ────────────
+    # 1) only one real column detected   → looks like plain text
+    if len(col_starts) <= 2:            # note: sentinel makes it “2”
+        if DEBUG:
+            print("   only one inferred column → reject", file=sys.stderr)
+        return []
+
+    # 2) top & bottom horizontals must span (almost) the same width
+    EPS = 5.0
+    same_span = abs(top[0] - bot[0]) <= EPS and abs(top[2] - bot[2]) <= EPS
+    if not same_span:
+        if DEBUG:
+            print("   frame edges have different spans → reject", file=sys.stderr)
+        return []
+    # -------------------------------------------------------------------
+    
+    # build rows
+    rows_map = {}
+    for w in words:
+        mid_y = round(w[1], 1)
+        for c in range(len(col_starts) - 1):
+            if col_starts[c] <= w[0] < col_starts[c + 1]:
+                rows_map.setdefault(mid_y, [""] * (len(col_starts) - 1))
+                cell = rows_map[mid_y][c]
+                rows_map[mid_y][c] = (cell + " " + w[4]).strip()
+                break
+
+    rows = [rows_map[k] for k in sorted(rows_map)]
+    if DEBUG:
+        import sys
+        print(f"   built {len(rows)} rows", file=sys.stderr)
+
+    # fabricate pseudo‑Table
+    class _PseudoTable:
+        def __init__(self, bbox, rows):
+            self.bbox = bbox
+            self.row_count = len(rows)
+            self.col_count = max(len(r) for r in rows)
+            self._rows = rows
+        def extract(self):
+            return self._rows
+
+    return [_PseudoTable((x0, y0, x1, y1), rows)]
+
+def tight_bbox_from_cells(t: "fitz.Table") -> tuple[float, float, float, float]:
+    xs0, ys0, xs1, ys1 = [], [], [], []
+    for row in (t.cells or []):
+        for cell in (row or []):
+            if cell is None:
+                continue
+            x0, y0, x1, y1 = cell.bbox
+            xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+    if not xs0:
+        return t.bbox
+    return min(xs0), min(ys0), max(xs1), max(ys1)
+
+def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
+    """
+    1. Try the native PyMuPDF extractor (works for *true* fitz.Table).
+    2. If that fails we rebuild the rows from the words that fall
+       inside tbl.bbox – this also works for the pseudo‑tables the
+       fallback detector creates.
+    """
+    try:
+        return tbl.extract()
+    except Exception:
+        pass
+
+    x0, y0, x1, y1 = tbl.bbox
+    words = [w for w in page.get_text("words")
+             if x0 <= 0.5*(w[0]+w[2]) <= x1 and
+                y0 <= 0.5*(w[1]+w[3]) <= y1]
+
+    if not words:
+        return []
+
+    words.sort(key=lambda w: (round(w[1], 1), w[0]))
+
+    rows, cur_row, cur_y = [], [], None
+    for w in words:
+        y = round(w[1], 1)
+        if cur_y is None or abs(y - cur_y) > 2:
+            if cur_row:
+                rows.append(cur_row)
+            cur_row, cur_y = [w[4]], y
+        else:
+            cur_row.append(w[4])
+
+    if cur_row:
+        rows.append(cur_row)
+
+    split_on = re.compile(r'\s{2,}')
+    return [split_on.split(" ".join(r).strip()) for r in rows]
+
+def _compress_columns(rows, min_populated=2):
+    """
+    Remove columns that have fewer than `min_populated` non‑empty cells.
+    Returns a new list of rows.
+    """
+    if not rows:
+        return rows
+
+    max_cols = max(len(r) for r in rows)
+    counts   = [0] * max_cols
+    for r in rows:
+        for j, cell in enumerate(r):
+            if j < max_cols and cell and str(cell).strip():
+                counts[j] += 1
+
+    keep = [j for j, c in enumerate(counts) if c >= min_populated]
+    if len(keep) == max_cols:
+        return rows
+
+    new_rows = [[ (r[j] if j < len(r) else None) for j in keep ]
+                for r in rows]
+
+    new_rows = [r for r in new_rows if any(cell and str(cell).strip() for cell in r)]
+    return new_rows
+
+def table_feature_dict(page: fitz.Page, tbl: "fitz.Table", pno: int) -> dict:
+    rows = rows_from_table(page, tbl)
+    rows = _compress_columns(rows, min_populated=2)
+    
+    return {
+        "type":    "table",
+        "page":    pno + 1,
+        "bbox":    [round(v, 2) for v in tbl.bbox],
+        "row_cnt": len(rows),
+        "col_cnt": max((len(r) for r in rows), default=0),
+        "rows":    rows,
+        "text":    ""
+    }
+
+def in_any_table(x0, y0, x1, y1, tbl_boxes):
+    cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+    return any(x0b <= cx <= x1b and y0b <= cy <= y1b for
+               x0b, y0b, x1b, y1b in tbl_boxes)
 
 def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
     """
@@ -313,9 +550,17 @@ def flatten_rows(rows: List[Dict]) -> List[Dict]:
         )
     return flat
 
-def preprocess_page(page: fitz.Page) -> List[Dict]:
+def preprocess_page(page: fitz.Page, tbl_boxes=()) -> List[Dict]:
     logical_rows = split_and_tag_lines(page)
     cleaned_rows = merge_bullets(logical_rows)
+
+    if tbl_boxes:
+        logical_rows = [
+            r for r in logical_rows
+            if not in_any_table(r["bbox"][0], r["bbox"][1],
+                                r["bbox"][2], r["bbox"][3],
+                                tbl_boxes)
+        ]
 
     if DEBUG:
         for i, r in enumerate(cleaned_rows):
@@ -693,16 +938,23 @@ def make_output_chunk(seg: List[int], rows: List[Dict]) -> Dict:
     }
 
 def iterate_chunks(page):
-    rows = preprocess_page(page)
-    idx  = list(range(len(rows)))
-    tbl_boxes = []
+    tbls       = find_tables_fast(page)
+    tbl_boxes  = [t.bbox for t in tbls]
+
+    rows   = preprocess_page(page, tbl_boxes)
+    idx    = list(range(len(rows)))
     page_w, page_h = page.rect.width, page.rect.height
 
     segs = xy_cut_region(idx, rows, page_w, page_h,
-                            tbl_boxes, min_block_width=0.02)
-    if DEBUG:
-        print(f"[STAT] output blocks: {len(segs)}")
-    return [make_output_chunk(seg, rows) for seg in segs if seg]
+                         tbl_boxes, min_block_width=0.02)
+
+    text_blocks = [make_output_chunk(seg, rows) for seg in segs if seg]
+
+    table_blocks = [
+        table_feature_dict(page, t, page.number) for t in tbls
+    ]
+
+    return table_blocks + text_blocks
 
 if __name__ == "__main__":
     import sys, pathlib, json
