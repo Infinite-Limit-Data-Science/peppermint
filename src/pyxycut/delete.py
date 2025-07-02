@@ -420,12 +420,48 @@ def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
     return rx0 + g0*BIN_WIDTH, rx0 + g1*BIN_WIDTH + BIN_WIDTH
 
 def gap(a: Dict, b: Dict) -> float:
+    """
+    Measure the **vertical white-space** between two printed rows.
+
+    Parameters
+    ----------
+    a, b : Dict
+        Row dictionaries that already carry absolute page coordinates:
+        • ``y0`` – top edge of the row (baseline-aligned in PyMuPDF)
+        • ``y1`` – bottom edge of the row
+
+    Returns
+    -------
+    float
+        • **> 0.0**  → the rows are separated by that many points of blank paper  
+        • **0.0**    → the rows touch or overlap (negative distances are clamped)
+
+    Notes
+    -----
+    ``b["y0"] - a["y1"]`` gives the raw distance from the bottom of *row a*
+    to the top of *row b*.  Wrapping the result in ``max(0.0, …)`` normalises
+    all *touching / overlapping* cases to **“no gap” = 0.0** so later logic
+    can focus on *large enough* gaps without worrying about negative values.
+
+    This helper is the primitive that higher-level heuristics
+    (median-gap estimates, heading boosts, XY-cut recursion) build upon.
+    """
     return max(0.0, b["y0"] - a["y1"])
 
-def looks_like_heading(row: Dict, median_font: float, *, size_ratio: float = 1.15,
+def looks_like_heading(row: Dict,
+                       median_font: float,
+                       *,
+                       size_ratio: float = 1.15,
                        short_len: int = 60) -> bool:
+    """Return True for rows that look like a heading or sub‑heading."""
+    text = row["text"].strip()
+
+    # NEW: must contain at least one letter → excludes "• •" lines
+    if not any(ch.isalpha() for ch in text):
+        return False
+
     big_enough = row["size"] >= median_font * size_ratio
-    short_text = len(row["text"]) <= short_len
+    short_text = len(text) <= short_len
     return big_enough and short_text
 
 def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
@@ -561,17 +597,23 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     by_top   = sorted(idx, key=lambda i: lines[i]["y0"])
     med_font = statistics.median(lines[i]["size"] for i in idx)
 
+    gaps_white  = [] 
+    gaps_base   = [] 
     gaps = []
     for a, b in zip(by_top, by_top[1:]):
-        g = gap(lines[a], lines[b])
+        white_gap = gap(lines[a], lines[b])
+        base_gap  = lines[b]["y0"] - lines[a]["y0"]
 
         # heading → boost gap artificially
         if looks_like_heading(lines[a], med_font) or looks_like_heading(lines[b], med_font):
-            g = max(g, ROW_FACTOR * line_h + 1)
-        gaps.append(g)
+            base_gap = max(base_gap, ROW_FACTOR * line_h + 1)
+        gaps_white.append(white_gap)
+        gaps_base.append(base_gap)
 
-    med_gap = statistics.median(gaps) if gaps else 0
-    big = [k for k, g in enumerate(gaps)
+    med_gap = statistics.median(gaps_white) if gaps_white else 0
+    gaps    = gaps_base
+
+    big = [k for k, g in enumerate(gaps_base)
            if is_large_gap(g, line_h, med_gap)]
 
     if big:
@@ -639,7 +681,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
+                            "25M06-02C.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
