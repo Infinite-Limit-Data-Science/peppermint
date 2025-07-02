@@ -1,71 +1,29 @@
-#!/usr/bin/env python3
-# Extract text, headings and ruled tables from scientific PDFs
-# ------------------------------------------------------------
-# – page layout is analysed with a classic recursive XY‑cut
-# – paragraphs are detected by vertical whitespace
-# – headings are recognised by font size *or* outline numbers
-#   *or* (new) almost‑all‑caps strings such as “A B S T R A C T”
-# – simple ruled tables are returned as a separate JSON block
-#
-# This version is tested on
-#   “2024‑Artificial‑empathy‑in‑healthcare‑chatbots.pdf”
-# and fixes the two long‑standing issues:
-#   1. footer “2” being merged with header “L. Seitz”
-#   2. “ARTICLE INFO” disappearing after code refactors
-# ------------------------------------------------------------
-import fitz, statistics, json, re
-from   typing import List, Tuple, Any
+import re
+import fitz
+import statistics
+from statistics import median
+from collections import defaultdict
+from typing import List, Tuple, Dict, Iterable, Any
 
-# ──────── layout constants ───────────────────────────────────
-COL_FACTOR   = 1.0          # min. column gap  = 1.0 × char‑width
-ROW_FACTOR   = 1.5          # min. paragraph gap = 1.5 × line‑height
-BIN_WIDTH    = 1            # projection histogram bin in points
-FONT_TOL     = 0.5          # two spans are same font if ≤ 0.5 pt apart
-SIZE_FACTOR  = 1.15         # heading if ≥ 1.15 × region median font
-HDR_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+[A-Z]")   # “1.” / “2.1 …”
+COL_FACTOR   = 1.0
+ROW_FACTOR   = 1.5
+BIN_WIDTH    = 1
+BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 
-BBox = Tuple[float, float, float, float]               # helper alias
+xy_cut_region_depth = 0
 
-print(fitz.__doc__.split()[1])  
+DEBUG = True
 
-# ───────────────── table helpers ─────────────────────────────
-# ───────────────────────────────────────────────────────────────
-#  Fallback ruled‑table detector that works on PyMuPDF 1.26.1
-# ───────────────────────────────────────────────────────────────
-# ───────────────────────── ruled‑grid detector ──────────────────────
-# ───────────────────────── ruled‑grid detector ──────────────────────
-# ───────────────────────────────── ruled‑grid detector ─────────────────────────
-# ───────────────────────────────── ruled‑grid detector ─────────────────────────
 def find_tables_fast(page) -> list[Any]:
-    """
-    1.  Run MuPDF’s built‑in ruled‑table detector (“lines” strategy).
-    2.  If it returns nothing (thin rules are common in publisher PDFs),
-        • collect horizontal path segments from page.get_text("dict")
-          – these are already flattened, so they include rules drawn
-          inside Form‑XObjects even in PyMuPDF 1.26.1;
-        • take the uppermost and lowermost long segments as a frame;
-        • bucket the words inside that frame into rows / columns.
-    The function returns either real fitz.Table objects or one
-    pseudo‑Table with the same interface (.bbox, .row_count, .col_count,
-    .extract()) so the rest of the pipeline can stay unchanged.
-    """
-
-    DEBUG = True           # ← turn verbose diagnostics on / off
+    DEBUG = True
 
     def _horiz_segments(min_len=80, y_tol=1.0):
-        """
-        Return a list of (x0, y0, x1, y1) tuples for every *vector*
-        horizontal segment at least `min_len` pt long.
-        Works on PyMuPDF 1.26.1.  Tries `page.get_drawings()` first because
-        that API always lists Form‑XObject content; falls back to
-        get_text('dict') only when absolutely necessary.
-        """
         segs = []
 
-        for path in page.get_drawings():              # ≤1.26: no args
-            r = path["rect"]                          # bounding box
+        for path in page.get_drawings():
+            r = path["rect"]
             if r.height <= y_tol and r.width >= min_len:
-                y = r.y0                              # thin → treat as line
+                y = r.y0
                 segs.append((r.x0, y, r.x1, y))
 
         if not segs:
@@ -204,17 +162,13 @@ def tight_bbox_from_cells(t: "fitz.Table") -> tuple[float, float, float, float]:
     for row in (t.cells or []):
         for cell in (row or []):
             if cell is None:
-                continue               # empty or spanned‑over slot
+                continue
             x0, y0, x1, y1 = cell.bbox
             xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
     if not xs0:
-        return t.bbox                  # fallback
+        return t.bbox
     return min(xs0), min(ys0), max(xs1), max(ys1)
 
-# ─────────────────────────────────────────────────────────────
-#  Utility: return textual rows for either a real fitz.Table
-#  or the pseudo‑Table you fabricate in find_tables_fast()
-# ─────────────────────────────────────────────────────────────
 def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
     """
     1. Try the native PyMuPDF extractor (works for *true* fitz.Table).
@@ -222,13 +176,11 @@ def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
        inside tbl.bbox – this also works for the pseudo‑tables the
        fallback detector creates.
     """
-    # --- 1) built‑in --------------------------------------------------
     try:
-        return tbl.extract()          # will succeed on native tables
+        return tbl.extract()
     except Exception:
         pass
 
-    # --- 2) word‑based fallback --------------------------------------
     x0, y0, x1, y1 = tbl.bbox
     words = [w for w in page.get_text("words")
              if x0 <= 0.5*(w[0]+w[2]) <= x1 and
@@ -237,13 +189,12 @@ def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
     if not words:
         return []
 
-    # sort by reading order
     words.sort(key=lambda w: (round(w[1], 1), w[0]))
 
     rows, cur_row, cur_y = [], [], None
     for w in words:
         y = round(w[1], 1)
-        if cur_y is None or abs(y - cur_y) > 2:   # new line
+        if cur_y is None or abs(y - cur_y) > 2:
             if cur_row:
                 rows.append(cur_row)
             cur_row, cur_y = [w[4]], y
@@ -253,9 +204,6 @@ def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
     if cur_row:
         rows.append(cur_row)
 
-    # split the “cells” on two or more consecutive spaces so that
-    # tabular layouts produced with fixed‑width fonts don’t come out
-    # as one huge string (optional, but helps on publisher PDFs)
     split_on = re.compile(r'\s{2,}')
     return [split_on.split(" ".join(r).strip()) for r in rows]
 
@@ -267,7 +215,6 @@ def _compress_columns(rows, min_populated=2):
     if not rows:
         return rows
 
-    # count non‑empty cells per column
     max_cols = max(len(r) for r in rows)
     counts   = [0] * max_cols
     for r in rows:
@@ -276,14 +223,12 @@ def _compress_columns(rows, min_populated=2):
                 counts[j] += 1
 
     keep = [j for j, c in enumerate(counts) if c >= min_populated]
-    if len(keep) == max_cols:          # nothing to drop
+    if len(keep) == max_cols:
         return rows
 
-    # rebuild rows with kept columns only
     new_rows = [[ (r[j] if j < len(r) else None) for j in keep ]
                 for r in rows]
 
-    # optional: drop rows that became all‑empty
     new_rows = [r for r in new_rows if any(cell and str(cell).strip() for cell in r)]
     return new_rows
 
@@ -306,41 +251,328 @@ def in_any_table(x0, y0, x1, y1, tbl_boxes):
     return any(x0b <= cx <= x1b and y0b <= cy <= y1b for
                x0b, y0b, x1b, y1b in tbl_boxes)
 
-def get_lines(page: fitz.Page, tbl_boxes=()) -> List[dict]:
-    out: List[dict] = []
+def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
+    """
+    Return one dictionary **per physical baseline** on the page.
 
-    for blk in page.get_text("dict")["blocks"]:
-        if blk["type"] != 0:          # skip images etc.
+    ── PDF text hierarchy handled here ─────────────────────────────
+    • Block  - PyMuPDF “paragraph-level” unit, inferred from layout.
+    • Line   - all glyphs that share the *same baseline* inside a block.
+               A single baseline can mix styles, so PyMuPDF breaks it
+               into multiple *spans* while keeping one common bbox.
+    • Span   - a consecutive run of glyphs that share identical font
+               family, size, style, colour, writing direction, etc.
+
+      ┌─ Example:  “The  quick  bold  brown  fox”
+      │            └────┬────────────────────────── same line/baseline
+      │                 │
+      │        regular-face span(s)      bold-face span
+      └─────────────────────────────────────────────────────────────
+
+    Because one line may contain several spans, we compute the line’s
+    *dominant* font size as the statistical mode of its span sizes
+    (most common size across all spans).  This baseline-level record
+    is later combined with word-level data for gap detection, bullets,
+    and XY-cut segmentation.
+
+    Returns
+    -------
+    List[Dict]
+        Each dict contains:
+        • bbox      - (x0, y0, x1, y1) of the line
+        • spans     - raw span list for debugging
+        • fontsize  - dominant font size (float, points)
+    """
+    blocks = page.get_text("dict")["blocks"]
+    lines = []
+    for blk in blocks:
+        for ln in blk.get("lines", []):
+            sizes = [sp["size"] for sp in ln["spans"] if "size" in sp]
+            if not sizes:
+                continue
+            dominant = max(set(sizes), key=sizes.count)
+            lines.append(
+                {
+                    "bbox": ln["bbox"],
+                    "spans": ln["spans"],
+                    "fontsize": dominant,
+                }
+            )
+    return lines
+
+
+def bucket_words_by_baseline(page: fitz.Page, y_tol: float = 0.5) -> Dict[float, List[Dict]]:
+    """
+    Group every *word* on the page into buckets keyed by a quantized baseline
+    (Y₀ coordinate).
+        - Look at every word on the page.
+        - PyMuPDF hands each word to you with its position: (left x, top y, right x, bottom y, text, …)
+        - Give each word a “line-ID”.
+
+    ── Source granularity ─────────────────────────────────────────────
+    Uses ``page.get_text("words")`` which yields one tuple **per word**:
+        (x0, y0, x1, y1, text, block_no, line_no, word_no)
+
+    ── What “baseline bucketing” means ───────────────────────────────
+    • Words whose top-left Y₀ differs by ≤ *y_tol* points are considered to
+      lie on the *same* physical baseline.   
+    • The key is ``round(y0 / y_tol) * y_tol`` – a small grid that absorbs
+      minor anti-aliasing / hinting noise.
+
+    ── Output structure ──────────────────────────────────────────────
+    {
+        baseline_y : [                                 # sorted left→right
+            {
+                "bbox"  : (x0, y0, x1, y1),            # word rectangle
+                "text"  : "The",
+                "x0"    : x0,                          # cached for speed
+                "x1"    : x1,
+                "height": y1 - y0
+            },
+            …
+        ],
+        …
+    }
+
+    This fast lookup table is later consumed by ``split_physical_line`` and
+    column / gutter logic that require precise word-level gaps on a given
+    baseline.
+
+    Parameters
+    ----------
+    page : fitz.Page
+        Page from which to extract word tuples.
+    y_tol : float, default 0.5 pt
+        Quantisation quantum for baseline grouping.
+
+    Returns
+    -------
+    Dict[float, List[Dict]]
+        Maps each quantised baseline to its left-to-right list of words.
+    """
+    words = page.get_text("words")
+    buckets: Dict[float, List[Dict]] = defaultdict(list)
+    for w in words:
+        x0, y0, x1, y1, text, *_ = w
+        key = round(y0 / y_tol) * y_tol
+        buckets[key].append(
+            {
+                "bbox": (x0, y0, x1, y1),
+                "text": text,
+                "x0": x0,
+                "x1": x1,
+                "height": y1 - y0,
+            }
+        )
+    for seq in buckets.values():
+        seq.sort(key=lambda w: w["x0"])
+    return buckets
+
+
+def char_widths(word_dicts: Iterable[Dict]) -> List[float]:
+    widths = []
+    for w in word_dicts:
+        text = w["text"]
+        if not text:
+            continue
+        width = (w["x1"] - w["x0"]) / len(text)
+        widths.append(width)
+    return widths
+
+
+def split_baseline_into_chunks(
+    line: Dict,
+    line_words: List[Dict],
+    gap_factor: float = 2.5,
+) -> List[Dict]:
+    """
+    Break one **printed baseline** into smaller “logical rows” whenever a
+    *visually large* horizontal blank separates consecutive words.
+
+    Parameters
+    ----------
+    baseline_meta : Dict
+        The record produced by ``extract_baseline_lines`` for this baseline.
+        It already contains:
+            • bbox      – bounding-box for the *whole* baseline
+            • fontsize  – dominant font size on that baseline
+    words_on_baseline : List[Dict]
+        All word-level dicts that share this baseline, supplied by
+        ``bucket_words_by_baseline`` (each has x0, x1, bbox, text, …).  The
+        list **must be pre-sorted left→right**.
+    gap_factor : float, default 2.5
+        A horizontal gap is considered “large” if it is at least
+        ``gap_factor × median_character_width``.  Increase to split less,
+        decrease to split more aggressively.
+
+    Returns
+    -------
+    List[Dict]
+        Zero or more chunk dicts, each representing **one logical row**
+        printed on the same baseline but separated by a large gap.  Every
+        chunk contains:
+            • bbox      – union of its words
+            • text      – concatenation of its words with single spaces
+            • fontsize  – copied from *baseline_meta*
+            • baseline  – y-coordinate of this baseline (top of bbox)
+
+    Why this matters
+    ----------------
+    PDFs often place two semantically distinct items on the same baseline:
+
+        ▪ “• Apples       • Oranges”
+        ▪ “Name     Price”
+        ▪ “Premium:        $400”
+
+    Treating the entire baseline as one string would lose that structure.
+    By detecting unusually wide gaps (scaled by character width) we preserve
+    bullet lists, key-value pairs, and pseudo-columns for later layout
+    analysis.
+
+    Algorithm
+    ---------
+    1. Compute the median **character width** on this baseline:
+           w_char_med = median( (x1−x0)/len(text) for each word )
+    2. Define a threshold:
+           gap_threshold = gap_factor × w_char_med
+    3. Scan words left→right; whenever the white-space between *prev* and
+       *curr* (``curr.x0 − prev.x1``) ≥ gap_threshold, start a new chunk.
+    4. For every chunk, build the bounding box and join the text.
+    """
+    if not line_words:
+        if DEBUG:
+            print(f"[DROP] baseline {line['bbox'][1]:.2f} – "
+                f"0 words found, line lost")
+        return []
+    
+    width_vals = char_widths(line_words)
+    med = median(width_vals) if width_vals else 1.0
+    x_threshold = gap_factor * med
+
+    chunks = []
+    current_chunk: List[Dict] = [line_words[0]]
+    for prev, cur in zip(line_words, line_words[1:]):
+        gap = cur["x0"] - prev["x1"]
+        if gap >= x_threshold:
+            chunks.append(current_chunk)
+            current_chunk = []
+        current_chunk.append(cur)
+    chunks.append(current_chunk)
+
+    logical = []
+    for words in chunks:
+        x0 = min(w["x0"] for w in words)
+        x1 = max(w["x1"] for w in words)
+        y0 = min(w["bbox"][1] for w in words)
+        y1 = max(w["bbox"][3] for w in words)
+        text = " ".join(w["text"] for w in words)
+        logical.append(
+            {
+                "bbox": (x0, y0, x1, y1),
+                "text": text,
+                "fontsize": line["fontsize"],
+                "baseline": y0,
+            }
+        )
+    return logical
+
+def split_and_tag_lines(page: fitz.Page) -> List[Dict]:
+    """
+    Runs the full baseline → words mapping + sub‑line splitting.
+    Adds field 'is_bullet_only' to each logical chunk.
+    """
+    lines = extract_baseline_lines(page)
+    word_buckets = bucket_words_by_baseline(page)
+
+    logical_rows = []
+    for ln in lines:
+        y0 = ln["bbox"][1]
+        if DEBUG:
+            print(f"[BASE] y0={y0:7.2f}  text="
+                f"{' '.join(sp.get('text', '') for sp in ln['spans'])[:50]}")
+        key = round(y0 / 0.5) * 0.5
+        words_same_baseline = word_buckets.get(key, [])
+        chunks = split_baseline_into_chunks(ln, words_same_baseline)
+        for ck in chunks:
+            ck["is_bullet_only"] = bool(BULLET_RE.fullmatch(ck["text"].strip()))
+            logical_rows.append(ck)
+
+    return logical_rows
+
+
+def merge_bullets(rows: List[Dict], char_tol_factor: float = 1.0) -> List[Dict]:
+    merged = []
+    by_baseline: Dict[float, List[Dict]] = defaultdict(list)
+    for r in rows:
+        by_baseline[r["baseline"]].append(r)
+
+    for baseline, seq in by_baseline.items():
+        seq.sort(key=lambda r: r["bbox"][0])
+        if len(seq) == 1:
+            merged.extend(seq)
             continue
 
-        for l in blk["lines"]:
-            if not l["spans"]:        # empty line
-                continue
+        pool = [
+            (r["bbox"][2] - r["bbox"][0]) / max(1, len(r["text"]))
+            for r in seq if not r["is_bullet_only"]
+        ]
+        cw = median(pool) if pool else 1.0
 
-            x0 = min(s["bbox"][0] for s in l["spans"])
-            y0 = min(s["bbox"][1] for s in l["spans"])
-            x1 = max(s["bbox"][2] for s in l["spans"])
-            y1 = max(s["bbox"][3] for s in l["spans"])
+        keep = []
+        skip_ids = set()
+        for i, r in enumerate(seq):
+            if r["is_bullet_only"] and i + 1 < len(seq):
+                nxt = seq[i + 1]
+                if (
+                    abs(nxt["baseline"] - r["baseline"]) <= 3.0
+                    and abs(nxt["bbox"][0] - r["bbox"][0]) <= char_tol_factor * cw
+                ):
+                    nxt["text"] = f"{r['text']} {nxt['text']}"
+                    x0 = min(r["bbox"][0], nxt["bbox"][0])
+                    nxt["bbox"] = (x0, *nxt["bbox"][1:])
+                    skip_ids.add(id(r))
+        for r in seq:
+            if id(r) not in skip_ids:
+                keep.append(r)
+        merged.extend(keep)
 
-            if in_any_table(x0, y0, x1, y1, tbl_boxes):
-                continue
+    merged.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+    return merged
 
-            text = "".join(s["text"] for s in l["spans"]).strip("\n")
-            if not text:              # all‑whitespace line
-                continue
+def flatten_rows(rows: List[Dict]) -> List[Dict]:
+    flat = []
+    for r in rows:
+        x0, y0, x1, y1 = r["bbox"]
+        body = {k: v for k, v in r.items() if k not in {"bbox", "fontsize"}}
+        flat.append(
+            {"x0": x0, "y0": y0, "x1": x1, "y1": y1,
+             "size": r["fontsize"], **body}
+        )
+    return flat
 
-            size = statistics.median(s["size"] for s in l["spans"])
-            out.append({
-                "idx":  len(out),
-                "x0":   x0,  "y0": y0,
-                "x1":   x1,  "y1": y1,
-                "text": text,
-                "size": size,
-            })
+def preprocess_page(page: fitz.Page, tbl_boxes=()) -> List[Dict]:
+    logical_rows = split_and_tag_lines(page)
+    cleaned_rows = merge_bullets(logical_rows)
 
-    return out
+    if tbl_boxes:
+        logical_rows = [
+            r for r in logical_rows
+            if not in_any_table(r["bbox"][0], r["bbox"][1],
+                                r["bbox"][2], r["bbox"][3],
+                                tbl_boxes)
+        ]
 
-# ───────────── text helpers ──────────────────────────────────
+    if DEBUG:
+        for i, r in enumerate(cleaned_rows):
+            if "Conceptual background" in r["text"]:
+                x0, y0, x1, y1 = r["bbox"]
+                print(f"[ROW]  idx={i:3d}  survives preprocess  "
+                    f"x0={x0:.1f}  y0={y0:.1f}  width={x1-x0:.1f}")   
+
+    if DEBUG:
+        print(f"[STAT] rows after merge_bullets: {len(cleaned_rows)}")
+    return flatten_rows(cleaned_rows)
+
 def compute_dominant_sizes(lines: List[dict]) -> Tuple[float, float]:
     cw, lh = [], []
     for ln in lines:
@@ -351,44 +583,79 @@ def compute_dominant_sizes(lines: List[dict]) -> Tuple[float, float]:
     char = statistics.median(cw) if cw else 0
     if not lh:
         return char, 0
-    q1 = statistics.quantiles(lh, n=4)[0]       # throw away tiny superscripts
+    q1 = statistics.quantiles(lh, n=4)[0]
     core = [h for h in lh if h >= q1]
     return char, statistics.median(core)
 
-def is_all_caps(s: str) -> bool:
-    letters = [c for c in s if c.isalpha()]
-    if len(letters) < 4:                # ignore tiny words
-        return False
-    upper = sum(1 for c in letters if c.isupper())
-    return upper / len(letters) > 0.8
-
-def looks_like_heading(ln: dict, median_font: float) -> bool:
-    txt = ln["text"]
-    spaced_caps = txt.replace(" ", "").isupper() and len(txt) <= 30
-    bigger      = ln["size"] >= 1.10 * median_font
-    numeric     = bool(HDR_RE.match(txt))
-    return bigger or numeric or spaced_caps
-
-def gap(a: dict, b: dict) -> float:
-    return b["y0"] - a["y1"]
-
-def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
-    abs_floor = 0.6 * ROW_FACTOR * line_h
-    rel_floor = 1.2 * med_gap if med_gap else abs_floor
-    return g >= abs_floor and g >= rel_floor
-
-def compute_gap(a,b): return b["y0"]-a["y1"]
-
-def split_on_big_internal_gap(lines,row_factor,line_h):
-    out,cur=[],[lines[0]]
-    for p,n in zip(lines,lines[1:]):
-        if compute_gap(p,n)>=row_factor*line_h:
-            out.append(cur); cur=[n]
-        else: cur.append(n)
-    out.append(cur); return out
-
-# ───────────── recursive XY‑cut ───────────────────────────────
 def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
+    """
+    Detect a **mostly empty vertical stripe** (a “gutter”) inside the region
+    spanned by the rows indexed in *idx*.  Such a gutter is strong evidence
+    of a multi-column layout, and `xy_cut_region` will split on it before
+    attempting any horizontal cuts.
+
+    Parameters
+    ----------
+    lines : List[Dict]
+        All pre-processed row dictionaries for the current page (output of
+        `preprocess_page`).  Only geometry fields (`x0, x1`) are used here.
+    idx : List[int]
+        Indices of the rows that form the *current* rectangular region under
+        consideration.  We try to find a gutter **only inside this subset**.
+    page_w : float
+        Full page width, needed for a sanity check that prevents splitting
+        off unreasonably narrow columns.
+    char_w : float
+        Median character width for this region (obtained from
+        `compute_dominant_sizes`).  The minimum gutter width is scaled by
+        this value so “one character wide” on a small font is still accepted.
+    tol : float, default 0.02
+        Maximum fraction of rows that may *touch* the candidate gutter
+        (default 2 %).  Allows a few overhanging headlines or images without
+        cancelling the split.
+
+    Returns
+    -------
+    Optional[Tuple[float, float]]
+        `(gx0, gx1)` – left and right x-coordinates of the gutter in page
+        space – if a suitable stripe is found; otherwise `None`.
+
+    How the algorithm works
+    -----------------------
+    1. **Restrict the search** to the horizontal span that encloses all rows
+       in *idx* (`rx0 … rx1`).  Work entirely within that mini-rectangle.
+
+    2. **Discretise** that span into 1 pt-wide vertical bins
+       (`BIN_WIDTH = 1`).  For every row, mark all bins it overlaps.  The
+       result is a histogram `hist[b]` counting “how many rows touch this
+       bin?”
+
+    3. **Thresholds**  
+       • *max_occ* = `max(1, tol × len(idx))`  
+         → bins touched by no more than ~ 2 % of rows are “sufficiently
+         empty”.  
+       • *run_req* = `max(1, int(COL_FACTOR × char_w / BIN_WIDTH))`  
+         → the gutter must span at least one **character width** of empty
+         bins.
+
+    4. **Scan the histogram** looking for the *longest* consecutive run of
+       low-occupancy bins (≤ *max_occ*).  Store the best run.
+
+    5. **Return** the page-x coordinates of that run if it meets
+       *run_req*; else return `None`.
+
+    6. **Safety check in `xy_cut_region`**  
+       Even when a gutter is reported, the caller confirms both resulting
+       sub-regions are wider than `min_block_width × page_w` to avoid bogus
+       splits on accidental white-space.
+
+    Practical outcome
+    -----------------
+    For two-column documents, the gutter is the white channel between
+    columns; for key-value layouts it can be the wide gap after the keys.
+    Detecting it early lets XY-Cut recurse **left → middle-bridge → right**
+    instead of slicing horizontally first.
+    """
     rx0 = min(lines[i]["x0"] for i in idx)
     rx1 = max(lines[i]["x1"] for i in idx)
     w   = rx1 - rx0
@@ -404,7 +671,7 @@ def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
     max_occ = max(1, int(tol*len(idx)))
     run_req = max(1, int((COL_FACTOR*char_w)//BIN_WIDTH))
     best = None; cur = None
-    for j, occ in enumerate(hist+[max_occ+1]):          # sentinel
+    for j, occ in enumerate(hist+[max_occ+1]):
         if occ <= max_occ:
             cur = j if cur is None else cur
         elif cur is not None:
@@ -417,11 +684,130 @@ def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
     g0, g1, _ = best
     return rx0 + g0*BIN_WIDTH, rx0 + g1*BIN_WIDTH + BIN_WIDTH
 
-def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
-                  min_block_width=0.0):
-    if len(idx) <= 1:
-        return [idx]
+def gap(a: Dict, b: Dict) -> float:
+    """
+    Measure the **vertical white-space** between two printed rows.
 
+    Parameters
+    ----------
+    a, b : Dict
+        Row dictionaries that already carry absolute page coordinates:
+        • ``y0`` – top edge of the row (baseline-aligned in PyMuPDF)
+        • ``y1`` – bottom edge of the row
+
+    Returns
+    -------
+    float
+        • **> 0.0**  → the rows are separated by that many points of blank paper  
+        • **0.0**    → the rows touch or overlap (negative distances are clamped)
+
+    Notes
+    -----
+    ``b["y0"] - a["y1"]`` gives the raw distance from the bottom of *row a*
+    to the top of *row b*.  Wrapping the result in ``max(0.0, …)`` normalises
+    all *touching / overlapping* cases to **“no gap” = 0.0** so later logic
+    can focus on *large enough* gaps without worrying about negative values.
+
+    This helper is the primitive that higher-level heuristics
+    (median-gap estimates, heading boosts, XY-cut recursion) build upon.
+    """
+    return max(0.0, b["y0"] - a["y1"])
+
+def looks_like_heading(row: Dict,
+                       median_font: float,
+                       *,
+                       size_ratio: float = 1.15,
+                       short_len: int = 60) -> bool:
+    """Return True for rows that look like a heading or sub‑heading."""
+    text = row["text"].strip()
+
+    # NEW: must contain at least one letter → excludes "• •" lines
+    if not any(ch.isalpha() for ch in text):
+        return False
+
+    big_enough = row["size"] >= median_font * size_ratio
+    short_text = len(text) <= short_len
+    return big_enough and short_text
+
+def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
+    thresh_abs = ROW_FACTOR * line_h
+    thresh_rel = 2.5 * med_gap if med_gap else 0
+    return g >= max(thresh_abs, thresh_rel)
+
+def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
+    """
+    Look for a mostly empty horizontal stripe between the rows in *idx*.
+
+    Returns
+    -------
+    Optional[Tuple[float, float]]
+        (gy0, gy1) – top & bottom Y of the gap in page coordinates –  
+        or None if no sufficiently wide / clean stripe exists.
+    """
+    ry0 = min(lines[i]["y0"] for i in idx)
+    ry1 = max(lines[i]["y1"] for i in idx)
+    h   = ry1 - ry0
+    if h <= 0 or line_h == 0:
+        return None
+
+    BIN_HEIGHT = 1
+    bins = int(h // BIN_HEIGHT) + 1
+    hist = [0] * bins
+
+    for i in idx:
+        y0 = max(lines[i]["y0"], ry0); y1 = min(lines[i]["y1"], ry1)
+        b0 = int((y0 - ry0) // BIN_HEIGHT)
+        b1 = int((y1 - ry0) // BIN_HEIGHT)
+        for b in range(b0, b1 + 1):
+            hist[b] += 1
+
+    max_occ = max(1, int(tol * len(idx)))
+    run_req = max(1, int((ROW_FACTOR * line_h) // BIN_HEIGHT))
+
+    best = None; cur = None
+    for j, occ in enumerate(hist + [max_occ + 1]):
+        if occ <= max_occ:
+            cur = j if cur is None else cur
+        elif cur is not None:
+            run = j - cur
+            if run >= run_req and (best is None or run > best[2]):
+                best = (cur, j - 1, run)
+            cur = None
+
+    if not best:
+        return None
+    g0, g1, _ = best
+    return ry0 + g0 * BIN_HEIGHT, ry0 + g1 * BIN_HEIGHT + BIN_HEIGHT
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Main recursive XY‑cut
+# ──────────────────────────────────────────────────────────────────────────────
+def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
+                  *, min_block_width=0.02, min_block_height=0.02):
+    """
+    Split the region that consists of rows *idx* until no significant
+    vertical (column) **or** horizontal (paragraph) whitespace remains.
+
+    Returns
+    -------
+    List[List[int]]
+        A list of “leaf” segments, each being the list of row indices
+        that belong to one output text block.
+    """
+    global xy_cut_region_depth
+
+    if not idx or len(idx) == 1:
+        return [idx]
+    
+    if DEBUG:
+        first = min(lines[i]["y0"] for i in idx)
+        last  = max(lines[i]["y1"] for i in idx)
+        print(f"[XY] depth={xy_cut_region_depth:2d}  "
+              f"rows={len(idx):3d}  span=({first:.1f} … {last:.1f})")
+    xy_cut_region_depth += 1
+
+    # ── exclude rows that sit inside user‑supplied table boxes ──────────────
     def in_table(ln):
         cx = (ln["x0"] + ln["x1"]) / 2
         cy = (ln["y0"] + ln["y1"]) / 2
@@ -434,183 +820,144 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     if char_w == 0 or line_h == 0:
         return [idx]
 
-    # ───── try vertical split (columns) ───────────────
+    # ── 1) try vertical split (classic XY‑cut) ──────────────────────────────
     gutter = find_vertical_gutter(lines, idx, page_w, char_w)
     if gutter:
         gx0, gx1 = gutter
         left  = [i for i in idx if lines[i]["x1"] <= gx0]
         right = [i for i in idx if lines[i]["x0"] >= gx1]
         bridge = [i for i in idx if i not in left and i not in right
-                    and lines[i]["x0"] < gx1 and lines[i]["x1"] > gx0]
-        if left and right:
+                  and lines[i]["x0"] < gx1 and lines[i]["x1"] > gx0]
+
+        if left and right:                                   # sane split?
             min_w = min_block_width * page_w
-            if min_block_width and (
-                (max(lines[i]["x1"] for i in left) -
-                 min(lines[i]["x0"] for i in left) < min_w) or
-                (max(lines[i]["x1"] for i in right) -
-                 min(lines[i]["x0"] for i in right) < min_w)):
-                gutter = None
-        else:
-            gutter = None
+            l_w   = max(lines[i]["x1"] for i in left) - min(lines[i]["x0"] for i in left)
+            r_w   = max(lines[i]["x1"] for i in right) - min(lines[i]["x0"] for i in right)
+            if l_w >= min_w and r_w >= min_w:
+                return (xy_cut_region(sorted(left,  key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height)
+                     + xy_cut_region(sorted(bridge,key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height)
+                     + xy_cut_region(sorted(right, key=lambda i: lines[i]["y0"]),
+                                      lines, page_w, page_h, tbl_boxes,
+                                      min_block_width=min_block_width,
+                                      min_block_height=min_block_height))
 
-        if gutter:
-            return (
-                xy_cut_region(sorted(left,  key=lambda i: lines[i]["y0"]),
-                              lines, page_w, page_h, tbl_boxes, min_block_width)
-              + xy_cut_region(sorted(bridge,key=lambda i: lines[i]["y0"]),
-                              lines, page_w, page_h, tbl_boxes, min_block_width)
-              + xy_cut_region(sorted(right, key=lambda i: lines[i]["y0"]),
-                              lines, page_w, page_h, tbl_boxes, min_block_width)
-            )
+    # ── 2) try *horizontal* split (new branch) ──────────────────────────────
+    hgap = find_horizontal_gap(lines, idx, page_h, line_h)
+    if hgap:
+        gy0, gy1 = hgap
 
-    # ───── horizontal split (paragraphs) ──────────────
+        # three groups inside the candidate gap’s span
+        upper  = [i for i in idx if lines[i]["y1"] <= gy0]
+        lower  = [i for i in idx if lines[i]["y0"] >= gy1]
+        bridge = [i for i in idx                        # rows that touch the gap
+                  if i not in upper and i not in lower  # (straddle the stripe)
+                  and lines[i]["y0"] < gy1
+                  and lines[i]["y1"] > gy0]
+
+        if upper and lower:                                    # sane split?
+            min_h = min_block_height * page_h
+            u_h   = max(lines[i]["y1"] for i in upper) - min(lines[i]["y0"] for i in upper)
+            l_h   = max(lines[i]["y1"] for i in lower) - min(lines[i]["y0"] for i in lower)
+
+            if u_h >= min_h and l_h >= min_h:
+                return (
+                    # recurse on the *upper* chunk
+                    xy_cut_region(sorted(upper,  key=lambda i: lines[i]["y0"]),
+                                   lines, page_w, page_h, tbl_boxes,
+                                   min_block_width=min_block_width,
+                                   min_block_height=min_block_height)
+                  + # recurse on rows that straddled the gap
+                    xy_cut_region(sorted(bridge, key=lambda i: lines[i]["y0"]),
+                                   lines, page_w, page_h, tbl_boxes,
+                                   min_block_width=min_block_width,
+                                   min_block_height=min_block_height)
+                  + # recurse on the *lower* chunk
+                    xy_cut_region(sorted(lower,  key=lambda i: lines[i]["y0"]),
+                                   lines, page_w, page_h, tbl_boxes,
+                                   min_block_width=min_block_width,
+                                   min_block_height=min_block_height)
+                )
+
     by_top   = sorted(idx, key=lambda i: lines[i]["y0"])
     med_font = statistics.median(lines[i]["size"] for i in idx)
-    gaps, mids = [], []
+
+    gaps_white  = [] 
+    gaps_base   = [] 
+    gaps = []
     for a, b in zip(by_top, by_top[1:]):
-        g = gap(lines[a], lines[b])
+        white_gap = gap(lines[a], lines[b])
+        base_gap  = lines[b]["y0"] - lines[a]["y0"]
+
+        # heading → boost gap artificially
         if looks_like_heading(lines[a], med_font) or looks_like_heading(lines[b], med_font):
-            g = max(g, ROW_FACTOR * line_h + 1)
-        gaps.append(g)
-    med_gap = statistics.median(gaps) if gaps else 0
-    big = [k for k, g in enumerate(gaps) if is_large_gap(g, line_h, med_gap)]
+            base_gap = max(base_gap, ROW_FACTOR * line_h + 1)
+        gaps_white.append(white_gap)
+        gaps_base.append(base_gap)
+
+    med_gap = statistics.median(gaps_white) if gaps_white else 0
+    gaps    = gaps_base
+
+    big = [k for k, g in enumerate(gaps_base)
+           if is_large_gap(g, line_h, med_gap)]
+
     if big:
-        s = max(big, key=lambda k: gaps[k]) + 1
-        upper = by_top[:s]; lower = by_top[s:]
-        return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes, min_block_width) +
-                xy_cut_region(lower, lines, page_w, page_h, tbl_boxes, min_block_width))
+        split_pos = max(big, key=lambda k: gaps[k]) + 1
+        upper = by_top[:split_pos]
+        lower = by_top[split_pos:]
+        return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes,
+                              min_block_width=min_block_width,
+                              min_block_height=min_block_height)
+             + xy_cut_region(lower, lines, page_w, page_h, tbl_boxes,
+                              min_block_width=min_block_width,
+                              min_block_height=min_block_height))
+
+    # ── 4) nothing to cut – return the current region ──────────────────────
     return [idx]
 
-# ───────── main page routine ─────────────────────────
-def segment_page(page, min_block_width_frac: float = 0.0) -> list[dict]:
-    """
-    Return a list[{type,font_size,bbox,text}] for *one* MuPDF page.
-    – honours: multi‑column layout, headings, very wide gaps, page header/footer,
-               and masks ruling‑line tables when computing statistics.
-    """
-    tbls            = find_tables_fast(page)
-    tbl_boxes       = [t.bbox for t in tbls]
-    lines           = get_lines(page, tbl_boxes)
+def make_output_chunk(seg: List[int], rows: List[Dict]) -> Dict:
+    x0 = min(rows[i]["x0"] for i in seg)
+    y0 = min(rows[i]["y0"] for i in seg)
+    x1 = max(rows[i]["x1"] for i in seg)
+    y1 = max(rows[i]["y1"] for i in seg)
 
-    if not lines and not tbls:
-        return []
+    font = statistics.median(rows[i]["size"] for i in seg)
 
-    # ----------------- basic layout information -----------------
+    text = " ".join(rows[i]["text"] for i in seg)
+
+    return {
+        "type": "text",
+        "font_size": round(font, 2),
+        "bbox": [x0, y0, x1, y1],
+        "text": text,
+    }
+
+def iterate_chunks(page):
+    tbls       = find_tables_fast(page)
+    tbl_boxes  = [t.bbox for t in tbls]
+
+    rows   = preprocess_page(page, tbl_boxes)
+    idx    = list(range(len(rows)))
     page_w, page_h = page.rect.width, page.rect.height
-    line_h = statistics.median(ln["y1"] - ln["y0"] for ln in lines)
-    first_text_y = min(ln["y0"] for ln in lines)
-    top_band     = first_text_y + 2.0 * line_h
 
-    last_text_y  = max(ln["y1"] for ln in lines)
-    bot_band     = last_text_y - 2.0 * line_h
+    segs = xy_cut_region(idx, rows, page_w, page_h,
+                         tbl_boxes, min_block_width=0.02)
 
-    idx            = list(range(len(lines)))          # <‑‑ was missing
-    head_idx       = [i for i in idx if lines[i]["y1"] <= top_band]
-    foot_idx       = [i for i in idx if lines[i]["y0"] >= bot_band]
-    body_idx       = [i for i in idx if i not in head_idx + foot_idx]
+    text_blocks = [make_output_chunk(seg, rows) for seg in segs if seg]
 
+    table_blocks = [
+        table_feature_dict(page, t, page.number) for t in tbls
+    ]
 
-    def median_font(idx_list):
-        fonts = [lines[i]["size"] for i in idx_list if lines[i]["text"].strip()]
-        return statistics.median(fonts) if fonts else 0
+    return table_blocks + text_blocks
 
-    # ── merge header back into body when it is probably not a header ──
-    if head_idx and body_idx:
-        head_last_y  = max(lines[i]["y1"] for i in head_idx)
-        body_first_y = min(lines[i]["y0"] for i in body_idx)
-
-        close_enough = (body_first_y - head_last_y) < ROW_FACTOR * line_h
-
-        head_font = median_font(head_idx)
-        body_font = median_font(body_idx)
-        same_font = abs(head_font - body_font) <= FONT_TOL
-
-        if close_enough and same_font:
-            body_idx += head_idx
-            head_idx  = []
-    # ------------------------------------------------------------------
-
-
-    # ----------------- tables (only for *masking* stats) --------
- 
-    # ----------------- XY‑cut on each zone ----------------------
-    blocks_idx  : list[list[int]] = []
-
-    if head_idx:
-        blocks_idx += xy_cut_region(sorted(head_idx, key=lambda i: lines[i]["y0"]),
-                                    lines, page_w, page_h,
-                                    tbl_boxes, min_block_width_frac)
-
-    if body_idx:
-        blocks_idx += xy_cut_region(sorted(body_idx, key=lambda i: lines[i]["y0"]),
-                                    lines, page_w, page_h,
-                                    tbl_boxes, min_block_width_frac)
-
-    if foot_idx:
-        blocks_idx += xy_cut_region(sorted(foot_idx, key=lambda i: lines[i]["y0"]),
-                                    lines, page_w, page_h,
-                                    tbl_boxes, min_block_width_frac)
-
-    # ----------------- build JSON blocks ------------------------
-    out      : list[dict] = []
-    for idx_list in blocks_idx:
-        blk_lines = [lines[i] for i in idx_list]
-        if not blk_lines:                       # <‑‑ guards the median()
-            continue
-
-        # ❶ split on very wide vertical gaps inside *this* block
-        line_h  = statistics.median(ln["y1"] - ln["y0"] for ln in blk_lines)
-        parts   = split_on_big_internal_gap(blk_lines, ROW_FACTOR, line_h)
-
-        for part in parts:
-            # ❷ sub‑split on font changes
-            segments, cur = [], [part[0]]
-            for prev, nxt in zip(part, part[1:]):
-                same_font = abs(nxt["size"] - prev["size"]) <= FONT_TOL
-                big_gap   = (nxt["y0"] - prev["y1"]) >= ROW_FACTOR * line_h
-                if same_font and not big_gap:
-                    cur.append(nxt)
-                else:
-                    segments.append(cur); cur = [nxt]
-            segments.append(cur)
-
-            # ❸ emit JSON
-            for seg in segments:
-                xs = [ln["x0"] for ln in seg] + [ln["x1"] for ln in seg]
-                ys = [ln["y0"] for ln in seg] + [ln["y1"] for ln in seg]
-
-                text, prev = [], ""
-                for ln in seg:
-                    t = ln["text"].strip()
-                    if text and prev.endswith("-"):
-                        text[-1] = text[-1][:-1] + t     # soft hyphen
-                    else:
-                        text.append(t)
-                    prev = t
-
-                out.append({
-                    "type":      "text",
-                    "order":     seg[0]["idx"],
-                    "font_size": round(statistics.median(ln["size"] for ln in seg), 2),
-                    "bbox":      [round(min(xs),2), round(min(ys),2),
-                                  round(max(xs),2), round(max(ys),2)],
-                    "text":      " ".join(text)
-                })
-
-    # natural reading order
-    out.sort(key=lambda b: b["order"])
-    for b in out:
-        del b["order"]
-    
-    for t in sorted(tbls, key=lambda T: T.bbox[1]):
-        out.insert(0, table_feature_dict(page, t, page.number))
-
-    return out
-
-
-# ──────────────── CLI wrapper ────────────────────────
 if __name__ == "__main__":
-    import sys, pathlib
+    import sys, pathlib, json
 
     def parse_pages(expr, max_p):
         if expr is None:
@@ -637,6 +984,6 @@ if __name__ == "__main__":
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
-    result = [{"page": p+1, "blocks": segment_page(doc.load_page(p))}
+    result = [{"page": p+1, "blocks": iterate_chunks(doc.load_page(p))}
               for p in pages]
-    print(json.dumps(result, ensure_ascii=False, indent=2)) 
+    print(json.dumps(result, ensure_ascii=False, indent=2))
