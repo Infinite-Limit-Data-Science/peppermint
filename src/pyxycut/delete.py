@@ -10,6 +10,10 @@ ROW_FACTOR   = 1.5
 BIN_WIDTH    = 1
 BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 
+xy_cut_region_depth = 0
+
+DEBUG = True
+
 def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
     """
     Return one dictionary **per physical baseline** on the page.
@@ -199,6 +203,9 @@ def split_baseline_into_chunks(
     4. For every chunk, build the bounding box and join the text.
     """
     if not line_words:
+        if DEBUG:
+            print(f"[DROP] baseline {line['bbox'][1]:.2f} – "
+                f"0 words found, line lost")
         return []
     
     width_vals = char_widths(line_words)
@@ -243,6 +250,9 @@ def split_and_tag_lines(page: fitz.Page) -> List[Dict]:
     logical_rows = []
     for ln in lines:
         y0 = ln["bbox"][1]
+        if DEBUG:
+            print(f"[BASE] y0={y0:7.2f}  text="
+                f"{' '.join(sp.get('text', '') for sp in ln['spans'])[:50]}")
         key = round(y0 / 0.5) * 0.5
         words_same_baseline = word_buckets.get(key, [])
         chunks = split_baseline_into_chunks(ln, words_same_baseline)
@@ -306,6 +316,16 @@ def flatten_rows(rows: List[Dict]) -> List[Dict]:
 def preprocess_page(page: fitz.Page) -> List[Dict]:
     logical_rows = split_and_tag_lines(page)
     cleaned_rows = merge_bullets(logical_rows)
+
+    if DEBUG:
+        for i, r in enumerate(cleaned_rows):
+            if "Conceptual background" in r["text"]:
+                x0, y0, x1, y1 = r["bbox"]
+                print(f"[ROW]  idx={i:3d}  survives preprocess  "
+                    f"x0={x0:.1f}  y0={y0:.1f}  width={x1-x0:.1f}")   
+
+    if DEBUG:
+        print(f"[STAT] rows after merge_bullets: {len(cleaned_rows)}")
     return flatten_rows(cleaned_rows)
 
 def compute_dominant_sizes(lines: List[dict]) -> Tuple[float, float]:
@@ -530,8 +550,17 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
         A list of “leaf” segments, each being the list of row indices
         that belong to one output text block.
     """
+    global xy_cut_region_depth
+
     if not idx or len(idx) == 1:
         return [idx]
+    
+    if DEBUG:
+        first = min(lines[i]["y0"] for i in idx)
+        last  = max(lines[i]["y1"] for i in idx)
+        print(f"[XY] depth={xy_cut_region_depth:2d}  "
+              f"rows={len(idx):3d}  span=({first:.1f} … {last:.1f})")
+    xy_cut_region_depth += 1
 
     # ── exclude rows that sit inside user‑supplied table boxes ──────────────
     def in_table(ln):
@@ -577,22 +606,38 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     hgap = find_horizontal_gap(lines, idx, page_h, line_h)
     if hgap:
         gy0, gy1 = hgap
-        upper = [i for i in idx if lines[i]["y1"] <= gy0]
-        lower = [i for i in idx if lines[i]["y0"] >= gy1]
 
-        if upper and lower:                                 # sane split?
+        # three groups inside the candidate gap’s span
+        upper  = [i for i in idx if lines[i]["y1"] <= gy0]
+        lower  = [i for i in idx if lines[i]["y0"] >= gy1]
+        bridge = [i for i in idx                        # rows that touch the gap
+                  if i not in upper and i not in lower  # (straddle the stripe)
+                  and lines[i]["y0"] < gy1
+                  and lines[i]["y1"] > gy0]
+
+        if upper and lower:                                    # sane split?
             min_h = min_block_height * page_h
             u_h   = max(lines[i]["y1"] for i in upper) - min(lines[i]["y0"] for i in upper)
             l_h   = max(lines[i]["y1"] for i in lower) - min(lines[i]["y0"] for i in lower)
+
             if u_h >= min_h and l_h >= min_h:
-                return (xy_cut_region(sorted(upper, key=lambda i: lines[i]["y0"]),
-                                      lines, page_w, page_h, tbl_boxes,
-                                      min_block_width=min_block_width,
-                                      min_block_height=min_block_height)
-                     + xy_cut_region(sorted(lower, key=lambda i: lines[i]["y0"]),
-                                      lines, page_w, page_h, tbl_boxes,
-                                      min_block_width=min_block_width,
-                                      min_block_height=min_block_height))
+                return (
+                    # recurse on the *upper* chunk
+                    xy_cut_region(sorted(upper,  key=lambda i: lines[i]["y0"]),
+                                   lines, page_w, page_h, tbl_boxes,
+                                   min_block_width=min_block_width,
+                                   min_block_height=min_block_height)
+                  + # recurse on rows that straddled the gap
+                    xy_cut_region(sorted(bridge, key=lambda i: lines[i]["y0"]),
+                                   lines, page_w, page_h, tbl_boxes,
+                                   min_block_width=min_block_width,
+                                   min_block_height=min_block_height)
+                  + # recurse on the *lower* chunk
+                    xy_cut_region(sorted(lower,  key=lambda i: lines[i]["y0"]),
+                                   lines, page_w, page_h, tbl_boxes,
+                                   min_block_width=min_block_width,
+                                   min_block_height=min_block_height)
+                )
 
     by_top   = sorted(idx, key=lambda i: lines[i]["y0"])
     med_font = statistics.median(lines[i]["size"] for i in idx)
@@ -655,6 +700,8 @@ def iterate_chunks(page):
 
     segs = xy_cut_region(idx, rows, page_w, page_h,
                             tbl_boxes, min_block_width=0.02)
+    if DEBUG:
+        print(f"[STAT] output blocks: {len(segs)}")
     return [make_output_chunk(seg, rows) for seg in segs if seg]
 
 if __name__ == "__main__":
