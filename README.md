@@ -135,3 +135,31 @@ The reliable way is to combine the two:
   "text": "• Non‑covered charges\n• Benefit penalties",
   ...
 }
+
+
+When I change the ROW_FACTOR to 1.3 from 1.5, in the other document 25M06-02C.pdf the first two paragraphs become all individual lines. But in the 2024-artificial-empathy-in-healthcare-chatbots.pdf, 1.5 causes the top page title "L. Seitz" to merge with the paragraph underneath despite the large gap. Be honest to me. Can we solve this with rules? Visually on the page, i can clearly see when things should be grouped together based on gaps, but updating the parameter for one document affects the other. Will we need to use a decision tree classifier? 
+
+Yes, you can keep this purely rule‑based if you let the rules adapt automatically to each page’s own statistics rather than hard‑coding a single constant such as ROW_FACTOR = 1.5.
+
+Below I explain why the fixed threshold breaks, how to derive a page‑adaptive threshold instead, and what a light‑weight ML fallback would look like if you ever outgrow the heuristics.
+
+1 Why the single constant breaks
+
+| Document                      | Median physical line‑height (`line_h`) | Typical inter‑paragraph white‑gap | Gap expressed as `gap / line_h` |
+| ----------------------------- | -------------------------------------- | --------------------------------- | ------------------------------- |
+| *25M06‑02C.pdf*               | ≈ 9.5 pt                               | 13–14 pt                          | **≈ 1.4×**                      |
+| *2024‑Artificial‑empathy.pdf* | ≈ 13 pt                                | 20–22 pt                          | **≈ 1.6–1.7×**                  |
+- When you set ROW_FACTOR = 1.5, the second paper’s gaps are above the threshold → paragraphs merge correctly.
+- In the first paper the gaps are only ~1.4 × line_h → they miss the 1.5 cut‑off and each physical line becomes a separate “paragraph”.
+
+The ratio “white gap ÷ line‑height” that separates paragraphs is not constant across layouts. Publisher templates, font sizes and leading vary from file to file.
+
+Instead of one global constant, compute a cut‑off from the distribution of gaps inside the current block/page. Two robust alternatives:
+
+| Method             | Implementation sketch                                              | Effect                                      |                                                 |                                               |
+| ------------------ | ------------------------------------------------------------------ | ------------------------------------------- | ----------------------------------------------- | --------------------------------------------- |
+| **Median + k·MAD** | \`\`\`python<br>median\_gap = median(gaps\_white)<br>mad = median( | g - median\_gap                             | )<br>threshold = median\_gap + 1.5 \* mad\`\`\` | Adjusts automatically; resistant to outliers. |
+| **Percentile**     | `python<br>threshold = quantile(gaps_white, 0.75)  # 75‑th %`      | Uses the upper quartile as the split point. |                                                 |                                               |
+
+
+

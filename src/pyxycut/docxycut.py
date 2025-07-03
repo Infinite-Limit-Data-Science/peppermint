@@ -54,111 +54,111 @@ def _column_layout(section):
 
     return 1, Pt(18).pt
 
-def extract_rows_from_docx(docx_path: str):
-    """
-    Parse paragraphs + tables into row‑dicts that XY‑cut understands.
+from docx import Document
 
-    Key improvements vs. previous attempt
-    -------------------------------------
-    • Honors *space_before* / *space_after* so large gaps create separate
-      blocks (exactly your PDF behaviour).
-    • Uses real column positions (Word Columns feature) instead of the
-      naive stripe distribution, so the gutter on page 3 is empty.
-    • Bbox width = full column width => vertical‑gutter detector sees the
-      white stripe even when the paragraph text is short.
-    """
+def extract_rows_from_docx(docx_path):
     doc = Document(docx_path)
-    rows, tables = [], []
+    rows = []
+    current_page = 1
+    current_column = 1
+    # Determine page margins and column settings per section
+    section_cols = []  # list of (page_start, num_cols, col_width, gutter_width)
+    for i, section in enumerate(doc.sections):
+        num_cols = section.columns.number or 1
+        gutter = section.columns.spacing  # in inches (if available) or default
+        # Compute column width (assuming equal width columns for simplicity)
+        if num_cols > 1:
+            total_width = section.page_width - section.left_margin - section.right_margin
+            col_width = (total_width - gutter*(num_cols-1)) / num_cols
+        else:
+            col_width = section.page_width - section.left_margin - section.right_margin
+        # If section starts on new page, note the page number
+        start_page = current_page
+        # If a section has a start_type = NEW_PAGE, increment page count by 1 for that break
+        # (You might need to detect section.start_type via docx or XML)
+        if i > 0 and section.start_type == WD_SECTION.NEW_PAGE:
+            start_page += 1
+        section_cols.append((start_page, num_cols, col_width, gutter))
+    # Now iterate paragraphs and tables
+    for block in doc.element.body:
+        if block.tag.endswith('sectPr'):
+            # Section break encountered – if it's a next-page section, increment page
+            sect = block
+            if sect.xpath('.//w:type[@w:val="nextPage"]'):
+                current_page += 1
+            # Reset column to 1 at start of new section
+            current_column = 1
+            continue
+        if block.tag.endswith('p'):  # paragraph
+            p = block
+            # Get all runs and texts
+            text_buffer = ""
+            for run in p.findall('.//w:r', namespaces={'w': '...'}):
+                # Check for breaks in the run
+                br = run.find('.//w:br', namespaces={'w':'...'})
+                if br is not None and br.get('{...}type') == 'column':
+                    # Column break: finalize current line as a row and start new column
+                    if text_buffer.strip():
+                        rows.append({
+                            "page": current_page,
+                            "column": current_column,
+                            "text": text_buffer.strip(),
+                            # estimate X, Y if possible...
+                        })
+                        text_buffer = ""
+                    current_column += 1  # move to next column
+                    # Reset vertical position (if tracking y, set y_cursor to top of column)
+                    # continue to next text in same paragraph (which now is column 2)
+                    continue
+                # Otherwise, handle text normally
+                t = run.find('.//w:t', namespaces={'w': '...'})
+                if t is not None:
+                    text_buffer += t.text
+            # End of paragraph – flush remaining text_buffer as a row
+            if text_buffer.strip():
+                rows.append({
+                    "page": current_page,
+                    "column": current_column,
+                    "text": text_buffer.strip(),
+                    # calculate approximate x by current_column:
+                    # x = section.left_margin + (current_column-1) * (col_width + gutter)
+                    # y = current_y_position ...
+                })
+            # After paragraph, update current_y_position += paragraph_height
+            # If paragraph has page break or section break at end, that will be caught above
+        elif block.tag.endswith('tbl'):
+            # Handle table rows similarly (omitted for brevity)
+            ...
+    return rows
 
-    # -- initial section settings -----------------------------------------
-    section_iter = iter(doc.sections)
-    section      = next(section_iter)
-    col_cnt, col_spc = _column_layout(section)
-    pg_w_pt = section.page_width / EMU_PER_PT
-    left_mar= section.left_margin / EMU_PER_PT
-    col_w   = (pg_w_pt - left_mar*2 - col_spc*(col_cnt-1)) / col_cnt
-    y_cursor= section.top_margin / EMU_PER_PT
-
-    def start_new_section(sec):
-        nonlocal section, col_cnt, col_spc, col_w, pg_w_pt, left_mar, y_cursor
-        section   = sec
-        col_cnt, col_spc = _column_layout(section)
-        pg_w_pt   = section.page_width / EMU_PER_PT
-        left_mar  = section.left_margin / EMU_PER_PT
-        col_w     = (pg_w_pt - left_mar*2 - col_spc*(col_cnt-1)) / col_cnt
-        y_cursor  = max(y_cursor, section.top_margin / EMU_PER_PT)
-
-    # --------------------------------------------------------------------
-    para_idx = 0
-    for xml_block in doc.element.body:
-        tag = xml_block.tag.split('}')[-1]
-
-        # ----------------- PARAGRAPH ------------------------------------
-        if tag == "p":
-            par = doc.paragraphs[para_idx]; para_idx += 1
-            raw_text = par.text.replace('\xa0',' ').strip()
-            bullet   = _bullet_char(par)
-            if bullet and not raw_text.startswith(bullet):
-                raw_text = f"{bullet} {raw_text}"
-            if not raw_text:
-                # empty line: still respect Word spacing_after
-                space_after = par.paragraph_format.space_after
-                y_cursor += (space_after.pt if space_after else _font_size(par))
-                continue
-
-            size      = _font_size(par)
-            heading   = _is_heading(par)
-            # Word paragraph spacing (points)
-            space_before = par.paragraph_format.space_before
-            space_after  = par.paragraph_format.space_after
-            before_pt = space_before.pt if space_before else 0
-            after_pt  = space_after .pt if space_after  else 0
-
-            # apply BEFORE spacing *once* before drawing this paragraph
-            y_cursor += before_pt
-
-            # assign to correct column band ------------------------------
-            # Word flows paragraphs round‑robin through columns **within
-            # each section page**.  We approximate by cycling modulo col_cnt.
-            col_idx = (para_idx-1) % col_cnt
-            x0      = left_mar + col_idx*(col_w + col_spc)
-            x1      = x0 + col_w                        # full column width
-
-            line_h  = size * 1.20
-            y0, y1  = y_cursor, y_cursor + line_h
-            y_cursor = y1 + after_pt                    # AFTER spacing
-
-            rows.append({
-                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                "size": size,
-                "text": raw_text,
-                "baseline": y0,
-                "is_bullet_only": BULLET_RE.fullmatch(raw_text) is not None,
-                "heading": heading,
-            })
-
-        # ----------------- TABLE ---------------------------------------
-        elif tag == "tbl":
-            tbl = doc.tables[len(tables)]
-            n_rows, n_cols = len(tbl.rows), len(tbl.columns)
-            mat = [[tbl.cell(r,c).text.strip() for c in range(n_cols)]
-                   for r in range(n_rows)]
-
-            x0 = left_mar
-            x1 = left_mar + col_cnt*col_w + (col_cnt-1)*col_spc
-            y0 = y_cursor
-            y1 = y_cursor + n_rows*12                    # coarse guess
-            y_cursor = y1 + 12
-
-            tables.append({"type":"table","bbox":[x0,y0,x1,y1],"rows":mat})
-
-        # ----------------- SECTION BREAK --------------------------------
-        elif tag == "sectPr":
-            start_new_section(next(section_iter, section))
-
-    rows.sort(key=lambda r:(r["y0"],r["x0"]))
-    return rows, tables
-
+def cluster_rows_to_blocks(rows):
+    blocks = []
+    # Group rows by page and then by columns if present
+    for page, page_rows in groupby(sorted(rows, key=lambda r: (r["page"], r["column"], r.get("y", 0))), key=lambda r: r["page"]):
+        page_rows = list(page_rows)
+        # Detect distinct column indices on this page
+        cols = sorted({r["column"] for r in page_rows})
+        for col in cols:
+            col_rows = [r for r in page_rows if r["column"] == col]
+            # Within each column, sort by Y (top-down)
+            col_rows.sort(key=lambda r: r.get("y", 0))
+            # Now split by vertical gaps
+            block_lines = []
+            prev_y = None
+            for r in col_rows:
+                y = r.get("y", None)
+                if prev_y is not None and y is not None:
+                    # If gap between this line and previous > threshold, start a new block
+                    if y - prev_y > SOME_VERTICAL_GAP_THRESHOLD:
+                        # finalize previous block
+                        blocks.append({"page": page, "column": col, "text": "\n".join(block_lines)})
+                        block_lines = []
+                block_lines.append(r["text"])
+                prev_y = y + r.get("height", 0)  # bottom of current line
+            # flush last block in this column
+            if block_lines:
+                blocks.append({"page": page, "column": col, "text": "\n".join(block_lines)})
+    return blocks
 
 def merge_bullets(rows, char_tol_factor=1.0):
     merged = []
@@ -364,14 +364,24 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
 def iterate_chunks_docx(path):
     rows, tables = extract_rows_from_docx(path)
     rows = merge_bullets(rows)
-    idx  = list(range(len(rows)))
 
-    # approximate page size in points
-    page_w = 612; page_h = 792      # default Letter
-    segments = xy_cut_region(idx, rows, page_w, page_h, tbl_boxes=[])
+    pages = defaultdict(lambda: {"rows": [], "tables": []})
+    for r in rows:   pages[r["page"]]["rows"  ].append(r)
+    for t in tables: pages[t["page"]]["tables"].append(t)
 
-    text_blocks=[make_block(seg, rows) for seg in segments if seg]
-    return text_blocks+tables
+    out = []
+    page_w, page_h = 612, 792
+    for pg in sorted(pages):
+        rows_pg   = pages[pg]["rows"]
+        tbls_pg   = pages[pg]["tables"]
+        idx_rows  = list(range(len(rows_pg)))
+
+        segs = xy_cut_region(idx_rows, rows_pg, page_w, page_h, tbl_boxes=[])
+        text_blocks = [make_block(seg, rows_pg) for seg in segs if seg]
+
+        out.append({"page": pg, "blocks": text_blocks + tbls_pg})
+    return out
+
 
 if __name__ == "__main__":
     if len(sys.argv)<2:

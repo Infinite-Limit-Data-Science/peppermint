@@ -903,6 +903,14 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     med_gap = statistics.median(gaps_white) if gaps_white else 0
     gaps    = gaps_base
 
+    if DEBUG:
+        for k, g in enumerate(gaps_base):
+            flag = is_large_gap(g, line_h, med_gap)
+            print(f"[GAP] k={k:3d}  g={g:5.1f}  "
+                f"abs_thr={ROW_FACTOR*line_h:5.1f}  "
+                f"rel_thr={2.5*med_gap:5.1f}  "
+                f"large? {flag}")
+
     big = [k for k, g in enumerate(gaps_base)
            if is_large_gap(g, line_h, med_gap)]
 
@@ -942,6 +950,10 @@ def iterate_chunks(page):
     tbl_boxes  = [t.bbox for t in tbls]
 
     rows   = preprocess_page(page, tbl_boxes)
+
+    rows = [r for r in rows
+            if not in_any_table(r["x0"], r["y0"], r["x1"], r["y1"], tbl_boxes)]
+
     idx    = list(range(len(rows)))
     page_w, page_h = page.rect.width, page.rect.height
 
