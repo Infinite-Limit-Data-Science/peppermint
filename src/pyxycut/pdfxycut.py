@@ -6,9 +6,11 @@ from collections import defaultdict
 from typing import List, Tuple, Dict, Iterable, Any
 
 COL_FACTOR   = 1.0
-ROW_FACTOR   = 1.5
 BIN_WIDTH    = 1
 BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
+
+ABS_GAP_MULT = 1.30
+REL_GAP_MULT = 1.10
 
 xy_cut_region_depth = 0
 
@@ -729,10 +731,10 @@ def looks_like_heading(row: Dict,
     short_text = len(text) <= short_len
     return big_enough and short_text
 
-def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
-    thresh_abs = ROW_FACTOR * line_h
-    thresh_rel = 2.5 * med_gap if med_gap else 0
-    return g >= max(thresh_abs, thresh_rel)
+def is_large_gap(g, *, line_h: float, p75_gap: float,
+                 abs_mult: float = 1.60,
+                 rel_mult: float = 1.25) -> bool:
+    return g >= abs_mult * line_h and g >= rel_mult * p75_gap
 
 def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
     """
@@ -762,7 +764,7 @@ def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
             hist[b] += 1
 
     max_occ = max(1, int(tol * len(idx)))
-    run_req = max(1, int((ROW_FACTOR * line_h) // BIN_HEIGHT))
+    run_req = max(1, int((ABS_GAP_MULT * line_h) // BIN_HEIGHT))
 
     best = None; cur = None
     for j, occ in enumerate(hist + [max_occ + 1]):
@@ -889,33 +891,33 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
 
     gaps_white  = [] 
     gaps_base   = [] 
-    gaps = []
     for a, b in zip(by_top, by_top[1:]):
         white_gap = gap(lines[a], lines[b])
         base_gap  = lines[b]["y0"] - lines[a]["y0"]
 
-        # heading → boost gap artificially
         if looks_like_heading(lines[a], med_font) or looks_like_heading(lines[b], med_font):
-            base_gap = max(base_gap, ROW_FACTOR * line_h + 1)
+            base_gap = max(base_gap, ABS_GAP_MULT * line_h + 1)
         gaps_white.append(white_gap)
         gaps_base.append(base_gap)
 
-    med_gap = statistics.median(gaps_white) if gaps_white else 0
-    gaps    = gaps_base
+    p75_gap = statistics.quantiles(gaps_white, n=4)[2] if len(gaps_white) >= 4 \
+          else max(gaps_white)
 
     if DEBUG:
         for k, g in enumerate(gaps_base):
-            flag = is_large_gap(g, line_h, med_gap)
+            flag = is_large_gap(g, line_h=line_h, p75_gap=p75_gap)
+            rel_display = f"{REL_GAP_MULT*p75_gap:5.1f}" if p75_gap is not None else "  N/A"
             print(f"[GAP] k={k:3d}  g={g:5.1f}  "
-                f"abs_thr={ROW_FACTOR*line_h:5.1f}  "
-                f"rel_thr={2.5*med_gap:5.1f}  "
+                f"abs_thr={ABS_GAP_MULT*line_h:5.1f}  "
+                f"rel_thr={rel_display}  "
                 f"large? {flag}")
 
+
     big = [k for k, g in enumerate(gaps_base)
-           if is_large_gap(g, line_h, med_gap)]
+           if is_large_gap(g, line_h=line_h, p75_gap=p75_gap)]
 
     if big:
-        split_pos = max(big, key=lambda k: gaps[k]) + 1
+        split_pos = max(big, key=lambda k: gaps_base[k]) + 1
         upper = by_top[:split_pos]
         lower = by_top[split_pos:]
         return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes,
@@ -992,7 +994,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "25M06-02C.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
+                            "2025Centene.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
