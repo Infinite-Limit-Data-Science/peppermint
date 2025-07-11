@@ -161,5 +161,7 @@ Instead of one global constant, compute a cut‑off from the distribution of gap
 | **Median + k·MAD** | \`\`\`python<br>median\_gap = median(gaps\_white)<br>mad = median( | g - median\_gap                             | )<br>threshold = median\_gap + 1.5 \* mad\`\`\` | Adjusts automatically; resistant to outliers. |
 | **Percentile**     | `python<br>threshold = quantile(gaps_white, 0.75)  # 75‑th %`      | Uses the upper quartile as the split point. |                                                 |                                               |
 
+Compare the candidate gap g with this data‑driven threshold rather than with ROW_FACTOR * line_h.
+
 
 
