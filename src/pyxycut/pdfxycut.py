@@ -298,39 +298,50 @@ def compute_page_gap_stats(rows: List[Dict]) -> tuple[float, float]:
 
     return page_abs_thr, page_p75_gap
 
-def merge_adjacent_blocks(blocks: List[Dict], *,
-                           page_abs_thr: float,
-                           min_horiz_overlap: float = 0.50) -> List[Dict]:
-    if not blocks:
+def merge_adjacent_blocks(
+        blocks: List[Dict],
+        *,
+        page_abs_thr: float,
+        page_p75_gap: float,          # NEW
+        cap_mult: float   = 3.0,
+        min_horiz_overlap: float = 0.50
+) -> List[Dict]:
+    """
+    Glue neighbour blocks that XY‑cut has sliced apart **without re‑sorting
+    the list that xy_cut_region already produced in reading order**.
+    """
+    if len(blocks) <= 1:
         return blocks
 
-    blocks = sorted(blocks, key=lambda b: b["bbox"][1])
-    merged = [blocks[0]]
+    # <‼> ❶ do **not** sort – keep xy_cut order
+    merged: List[Dict] = [blocks[0]]
+
+    # ❷ cap the absolute threshold so we never jump over *huge* gaps
+    merge_abs_thr = min(page_abs_thr, page_p75_gap * cap_mult)
 
     for blk in blocks[1:]:
         cur = merged[-1]
 
-        # --- vertical gap: baseline‑to‑baseline ---------------------------
-        v_gap = blk["bbox"][1] - cur["last_baseline"]
-
-        # --- horizontal overlap (unchanged) ------------------------------
+        v_gap = blk["bbox"][1] - cur["last_baseline"]          # baseline→top
         overlap = min(cur["bbox"][2], blk["bbox"][2]) - max(cur["bbox"][0],
                                                             blk["bbox"][0])
         min_width = min(cur["bbox"][2] - cur["bbox"][0],
                         blk["bbox"][2] - blk["bbox"][0])
-        h_ovlp_ratio = overlap / min_width if min_width > 0 else 0
+        h_ratio = overlap / min_width if min_width > 0 else 0.0
 
-        if v_gap < page_abs_thr and h_ovlp_ratio >= min_horiz_overlap:
-            # merge
+        if v_gap < merge_abs_thr and h_ratio >= min_horiz_overlap:
+            # …merge…
             cur["text"] = cur["text"].rstrip() + " " + blk["text"].lstrip()
             cur["bbox"][0] = min(cur["bbox"][0], blk["bbox"][0])
             cur["bbox"][2] = max(cur["bbox"][2], blk["bbox"][2])
             cur["bbox"][3] = blk["bbox"][3]
-            cur["last_baseline"] = blk["last_baseline"]   # update
+            cur["last_baseline"] = blk["last_baseline"]
         else:
             merged.append(blk)
 
     return merged
+
+
 
 def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
     """
@@ -1045,7 +1056,8 @@ def iterate_chunks(page):
 
     text_blocks = [make_output_chunk(seg, rows) for seg in segs if seg]
     text_blocks = merge_adjacent_blocks(text_blocks,
-                                        page_abs_thr=page_abs_thr)
+                                        page_abs_thr=page_abs_thr,
+                                        page_p75_gap=page_p75_gap)
 
     table_blocks = [
         table_feature_dict(page, t, page.number) for t in tbls
@@ -1077,7 +1089,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "64654-genesys.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
+                            "invoice-optum.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
