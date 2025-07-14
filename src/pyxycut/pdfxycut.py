@@ -298,6 +298,57 @@ def compute_page_gap_stats(rows: List[Dict]) -> tuple[float, float]:
 
     return page_abs_thr, page_p75_gap
 
+def region_threshold(idx: List[int],
+                     lines: List[dict],
+                     *,
+                     page_abs_thr: float,
+                     page_p75_gap: float,
+                     jump_ratio_req: float = 1.35,
+                     cap_mult: float = 3.0
+                     ) -> Tuple[float, float]:
+    """
+    Return an absolute gap threshold and a 75‑th–percentile gap that are
+    *specialised for the current subset* of rows (`idx`).
+
+    They are then compared with the page‑level thresholds in `xy_cut_region`
+    and the tighter of the two sets is used.
+    """
+    if len(idx) < 6:                           # tiny chunk – not stable
+        return page_abs_thr, page_p75_gap
+
+    # --- compute the distribution of baseline-to-baseline gaps ----------
+    by_top = sorted(idx, key=lambda i: lines[i]["y0"])
+    gaps   = [lines[b]["y0"] - lines[a]["y0"]
+              for a, b in zip(by_top, by_top[1:])
+              if lines[b]["y0"] > lines[a]["y0"]]
+
+    if not gaps:
+        return page_abs_thr, page_p75_gap
+
+    gaps.sort()
+    # 1.  absolute threshold via “largest jump” heuristic
+    jump_idx, best_ratio = None, 1.0
+    for j in range(1, len(gaps)):
+        r = gaps[j] / gaps[j-1] if gaps[j-1] else 1.0
+        if r > best_ratio:
+            best_ratio, jump_idx = r, j
+
+    if jump_idx is not None and best_ratio >= jump_ratio_req:
+        local_abs = 0.5 * (gaps[jump_idx-1] + gaps[jump_idx])
+    else:
+        local_abs = statistics.median(gaps) * 1.35
+
+    # 2.  safety‑cap against ridiculous values
+    med_gap = statistics.median(gaps)
+    local_abs = min(local_abs, med_gap * cap_mult)
+
+    # 3.  local 75‑th percentile
+    k75      = int(0.75 * (len(gaps) - 1))
+    local_p75 = gaps[k75]
+
+    return local_abs, local_p75
+
+
 def merge_adjacent_blocks(
         blocks: List[Dict],
         *,
@@ -895,6 +946,16 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     )
     if char_w == 0 or line_h == 0:
         return [idx]
+    
+    region_abs, region_p75 = region_threshold(
+        idx, lines,
+        page_abs_thr=page_abs_thr,
+        page_p75_gap=page_p75_gap
+    )
+
+    use_region = len(idx) >= 6 and region_abs < page_abs_thr * 0.95
+    abs_thr    = region_abs   if use_region else page_abs_thr
+    p75_gap    = region_p75   if use_region else page_p75_gap
 
     # ── 1) vertical split ──────────────────────────────
     gutter = find_vertical_gutter(lines, idx, page_w, char_w)
@@ -912,20 +973,20 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
             if l_w >= min_w and r_w >= min_w:
                 return (xy_cut_region(sorted(left,  key=lambda i: lines[i]["y0"]),
                                       lines, page_w, page_h, tbl_boxes,
-                                      page_abs_thr=page_abs_thr,
-                                      page_p75_gap=page_p75_gap,
+                                      page_abs_thr=abs_thr,
+                                      page_p75_gap=p75_gap,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height)
                      + xy_cut_region(sorted(bridge,key=lambda i: lines[i]["y0"]),
                                       lines, page_w, page_h, tbl_boxes,
-                                      page_abs_thr=page_abs_thr,
-                                      page_p75_gap=page_p75_gap,
+                                      page_abs_thr=abs_thr,
+                                      page_p75_gap=p75_gap,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height)
                      + xy_cut_region(sorted(right, key=lambda i: lines[i]["y0"]),
                                       lines, page_w, page_h, tbl_boxes,
-                                      page_abs_thr=page_abs_thr,
-                                      page_p75_gap=page_p75_gap,
+                                      page_abs_thr=abs_thr,
+                                      page_p75_gap=p75_gap,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height))
 
@@ -952,22 +1013,22 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
                     # recurse on the *upper* chunk
                     xy_cut_region(sorted(upper,  key=lambda i: lines[i]["y0"]),
                                    lines, page_w, page_h, tbl_boxes,
-                                   page_abs_thr=page_abs_thr,
-                                   page_p75_gap=page_p75_gap,
+                                   page_abs_thr=abs_thr,
+                                   page_p75_gap=p75_gap,
                                    min_block_width=min_block_width,
                                    min_block_height=min_block_height)
                   + # recurse on rows that straddled the gap
                     xy_cut_region(sorted(bridge, key=lambda i: lines[i]["y0"]),
                                    lines, page_w, page_h, tbl_boxes,
-                                   page_abs_thr=page_abs_thr,
-                                   page_p75_gap=page_p75_gap,
+                                   page_abs_thr=abs_thr,
+                                   page_p75_gap=p75_gap,
                                    min_block_width=min_block_width,
                                    min_block_height=min_block_height)
                   + # recurse on the *lower* chunk
                     xy_cut_region(sorted(lower,  key=lambda i: lines[i]["y0"]),
                                    lines, page_w, page_h, tbl_boxes,
-                                   page_abs_thr=page_abs_thr,
-                                   page_p75_gap=page_p75_gap,
+                                   page_abs_thr=abs_thr,
+                                   page_p75_gap=p75_gap,
                                    min_block_width=min_block_width,
                                    min_block_height=min_block_height)
                 )
@@ -982,8 +1043,8 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
         for k, g in enumerate(gaps_base):
             flag = is_large_gap(
                 g,
-                page_abs_thr=page_abs_thr,
-                page_p75_gap=page_p75_gap,
+                page_abs_thr=abs_thr,
+                page_p75_gap=p75_gap,
                 rel_mult=REL_GAP_MULT
             )
             print(f"[GAP] k={k:3d}  g={g:5.1f}  "
@@ -993,8 +1054,8 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
 
     big = [k for k, g in enumerate(gaps_base)
            if is_large_gap(g,
-                           page_abs_thr=page_abs_thr,
-                           page_p75_gap=page_p75_gap,
+                           page_abs_thr=abs_thr,
+                           page_p75_gap=p75_gap,
                            rel_mult=REL_GAP_MULT)]
 
     if big:
@@ -1002,13 +1063,13 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
         upper = by_top[:split_pos]
         lower = by_top[split_pos:]
         return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes,
-                              page_abs_thr=page_abs_thr,
-                              page_p75_gap=page_p75_gap,
+                              page_abs_thr=abs_thr,
+                              page_p75_gap=p75_gap,
                               min_block_width=min_block_width,
                               min_block_height=min_block_height)
              + xy_cut_region(lower, lines, page_w, page_h, tbl_boxes,
-                              page_abs_thr=page_abs_thr,
-                              page_p75_gap=page_p75_gap,
+                              page_abs_thr=abs_thr,
+                              page_p75_gap=p75_gap,
                               min_block_width=min_block_width,
                               min_block_height=min_block_height))
 
@@ -1089,7 +1150,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "invoice-optum.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
+                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf invoice-optum.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
