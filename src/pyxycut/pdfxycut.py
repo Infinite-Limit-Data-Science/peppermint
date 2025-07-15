@@ -9,9 +9,6 @@ COL_FACTOR   = 1.0
 BIN_WIDTH    = 1
 BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 
-ABS_GAP_MULT = 1.30
-REL_GAP_MULT = 1.10
-
 xy_cut_region_depth = 0
 
 DEBUG = True
@@ -251,6 +248,16 @@ def in_any_table(x0, y0, x1, y1, tbl_boxes):
     return any(x0b <= cx <= x1b and y0b <= cy <= y1b for
                x0b, y0b, x1b, y1b in tbl_boxes)
 
+def _median_plus_mad(values: List[float], k: float = 1.5) -> float:
+    """
+    Robust absolute threshold  =  median(values) + k · MAD(values)
+    """
+    if not values:
+        return 0.0
+    med = statistics.median(values)
+    mad = statistics.median(abs(v - med) for v in values)
+    return med + k * mad
+
 def compute_page_gap_stats(rows: List[Dict]) -> tuple[float, float]:
     """
     Analyse *all* baseline-to-baseline distances on the page and return
@@ -287,10 +294,7 @@ def compute_page_gap_stats(rows: List[Dict]) -> tuple[float, float]:
         if ratio > jump_ratio:
             jump_ratio, jump_idx = ratio, i
 
-    if jump_idx is not None and jump_ratio >= 1.35:
-        page_abs_thr = 0.5 * (gaps[jump_idx-1] + gaps[jump_idx])
-    else:
-        page_abs_thr = statistics.median(gaps) * 1.35
+    page_abs_thr = _median_plus_mad(gaps, k=1.5)
 
     # 75‑th percentile for the relative rule
     k75 = int(0.75 * (len(gaps) - 1))
@@ -326,17 +330,9 @@ def region_threshold(idx: List[int],
         return page_abs_thr, page_p75_gap
 
     gaps.sort()
-    # 1.  absolute threshold via “largest jump” heuristic
-    jump_idx, best_ratio = None, 1.0
-    for j in range(1, len(gaps)):
-        r = gaps[j] / gaps[j-1] if gaps[j-1] else 1.0
-        if r > best_ratio:
-            best_ratio, jump_idx = r, j
+ 
 
-    if jump_idx is not None and best_ratio >= jump_ratio_req:
-        local_abs = 0.5 * (gaps[jump_idx-1] + gaps[jump_idx])
-    else:
-        local_abs = statistics.median(gaps) * 1.35
+    local_abs = _median_plus_mad(gaps, k=1.5)
 
     # 2.  safety‑cap against ridiculous values
     med_gap = statistics.median(gaps)
@@ -872,19 +868,16 @@ def looks_like_heading(row: Dict,
     short_text = len(text) <= short_len
     return big_enough and short_text
 
-def is_large_gap(g: float,
-                 *, page_abs_thr: float,
-                    page_p75_gap: float,
-                    rel_mult: float = 1.10) -> bool:
-    if page_p75_gap == 0:           # extreme corner case
-        return g >= page_abs_thr
-    return g >= page_abs_thr and g >= rel_mult * page_p75_gap
+def is_large_gap(g: float, *, abs_thr: float, p75_gap: float, rel_mult: float = 1.10) -> bool:
+    if p75_gap == 0:
+        return g >= abs_thr
+    return g >= abs_thr and g >= rel_mult * p75_gap
 
-def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
+def find_horizontal_gap(lines, idx, *, run_req_pt: float, tol: float = 0.02):
     ry0 = min(lines[i]["y0"] for i in idx)
     ry1 = max(lines[i]["y1"] for i in idx)
     h   = ry1 - ry0
-    if h <= 0 or line_h == 0:
+    if h <= 0:
         return None
 
     BIN_HEIGHT = 1
@@ -899,7 +892,7 @@ def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
             hist[b] += 1
 
     max_occ = max(1, int(tol * len(idx)))
-    run_req = max(1, int((ABS_GAP_MULT * line_h) // BIN_HEIGHT))
+    run_req = max(1, int(run_req_pt // BIN_HEIGHT))
 
     best = None; cur = None
     for j, occ in enumerate(hist + [max_occ + 1]):
@@ -924,7 +917,7 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
                   *, page_abs_thr: float, page_p75_gap: float,
                   min_block_width=0.02, min_block_height=0.02):
     global xy_cut_region_depth
-
+    
     if not idx or len(idx) == 1:
         return [idx]
     
@@ -956,6 +949,11 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     use_region = len(idx) >= 6 and region_abs < page_abs_thr * 0.95
     abs_thr    = region_abs   if use_region else page_abs_thr
     p75_gap    = region_p75   if use_region else page_p75_gap
+
+    if DEBUG:
+        print(f"[XY] depth={xy_cut_region_depth:2d}  "
+            f"abs_thr={abs_thr:4.1f}  p75={p75_gap:4.1f}  "
+            f"rows={len(idx):3d}")
 
     # ── 1) vertical split ──────────────────────────────
     gutter = find_vertical_gutter(lines, idx, page_w, char_w)
@@ -991,7 +989,9 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
                                       min_block_height=min_block_height))
 
     # ── 2) *horizontal* split ──────────────────────────────
-    hgap = find_horizontal_gap(lines, idx, page_h, line_h)
+    hgap = find_horizontal_gap(lines, idx,
+                           run_req_pt = abs_thr,
+                           tol = 0.02)
     if hgap:
         gy0, gy1 = hgap
 
@@ -1038,25 +1038,20 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     gaps_base = [lines[b]["y0"] - lines[a]["y0"]
                  for a, b in zip(by_top, by_top[1:])]
 
-    
+    rel_mult = 1.10
     if DEBUG:
         for k, g in enumerate(gaps_base):
-            flag = is_large_gap(
-                g,
-                page_abs_thr=abs_thr,
-                page_p75_gap=p75_gap,
-                rel_mult=REL_GAP_MULT
-            )
+            flag = is_large_gap(g, abs_thr=abs_thr, p75_gap=p75_gap)
             print(f"[GAP] k={k:3d}  g={g:5.1f}  "
-                  f"abs_thr={page_abs_thr:5.1f}  "
-                  f"rel_thr={REL_GAP_MULT*page_p75_gap:5.1f}  "
+                  f"abs_thr={abs_thr:5.1f}  "
+                  f"rel_thr={rel_mult*p75_gap:5.1f}  "
                   f"large? {flag}")
 
     big = [k for k, g in enumerate(gaps_base)
            if is_large_gap(g,
-                           page_abs_thr=abs_thr,
-                           page_p75_gap=p75_gap,
-                           rel_mult=REL_GAP_MULT)]
+                           abs_thr=abs_thr,
+                           p75_gap=p75_gap,
+                           rel_mult=rel_mult)]
 
     if big:
         split_pos = max(big, key=lambda k: gaps_base[k]) + 1
@@ -1150,7 +1145,7 @@ if __name__ == "__main__":
                 arg_pages = sys.argv[2]
 
     pdf_path = pathlib.Path(arg_pdf or
-                            "2024-Artificial-empathy-in-healthcare-chatbots.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf invoice-optum.pdf
+                            "2025Centene.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf invoice-optum.pdf
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 
