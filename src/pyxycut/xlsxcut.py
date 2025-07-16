@@ -10,8 +10,7 @@ import openpyxl
 
 CellCoord = Tuple[int, int]
 
-
-def _workbook_from_path(path: pathlib.Path) -> Tuple[List[openpyxl.worksheet.worksheet.Worksheet], bool]:
+def workbook_from_path(path: pathlib.Path) -> Tuple[List[openpyxl.worksheet.worksheet.Worksheet], bool]:
     if path.suffix.lower() == ".csv":
         with path.open(newline="", encoding="utf-8") as fh:
             reader = list(csv.x(fh))
@@ -34,7 +33,7 @@ def _workbook_from_path(path: pathlib.Path) -> Tuple[List[openpyxl.worksheet.wor
     return wb.worksheets, False
 
 
-def _non_empty_matrix(ws) -> List[List[Any]]:
+def non_empty_matrix(ws) -> List[List[Any]]:
     data = [[None] * ws.max_column for _ in range(ws.max_row)]
     for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
         for c_idx, val in enumerate(row):
@@ -42,19 +41,19 @@ def _non_empty_matrix(ws) -> List[List[Any]]:
                 data[r_idx][c_idx] = val
     return data
 
-def _bounding_box(cells: Iterable[CellCoord]) -> Tuple[int, int, int, int]:
+def bounding_box(cells: Iterable[CellCoord]) -> Tuple[int, int, int, int]:
     rows, cols = zip(*cells)
     return min(rows), min(cols), max(rows), max(cols)
 
 
-def _adjacent(r: int, c: int, max_r: int, max_c: int) -> Iterable[CellCoord]:
+def adjacent(r: int, c: int, max_r: int, max_c: int) -> Iterable[CellCoord]:
     if r > 0:          yield (r - 1, c)
     if r < max_r - 1:  yield (r + 1, c)
     if c > 0:          yield (r, c - 1)
     if c < max_c - 1:  yield (r, c + 1)
 
 
-def _find_tables(grid: List[List[Any]]) -> List[dict]:
+def find_tables(grid: List[List[Any]]) -> List[dict]:
     if not grid:
         return []
 
@@ -74,12 +73,12 @@ def _find_tables(grid: List[List[Any]]) -> List[dict]:
                 continue
             visited[rr][cc] = True
             island.append((rr, cc))
-            for nr, nc in _adjacent(rr, cc, max_r, max_c):
+            for nr, nc in adjacent(rr, cc, max_r, max_c):
                 if not visited[nr][nc] and grid[nr][nc] is not None:
                     q.append((nr, nc))
 
         if island:
-            r0, c0, r1, c1 = _bounding_box(island)
+            r0, c0, r1, c1 = bounding_box(island)
 
             rows = [
                 [grid[rr][cc] for cc in range(c0, c1 + 1)]
@@ -97,7 +96,7 @@ def _find_tables(grid: List[List[Any]]) -> List[dict]:
             )
     return tables
 
-def _extract_images(ws, sheet_idx: int) -> List[dict]:
+def extract_images(ws, sheet_idx: int) -> List[dict]:
     out = []
     for img in getattr(ws, "_images", []):
         try:
@@ -131,27 +130,26 @@ def _extract_images(ws, sheet_idx: int) -> List[dict]:
         )
     return out
 
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Public API
-# ────────────────────────────────────────────────────────────────────────────
 def iterate_spreadsheet(file_path: str | pathlib.Path):
     path = pathlib.Path(file_path)
-    sheets, is_csv = _workbook_from_path(path)
+    sheets, is_csv = workbook_from_path(path)
 
     for s_idx, ws in enumerate(sheets):
-        grid = _non_empty_matrix(ws)
-        for tbl in _find_tables(grid):
+        grid = non_empty_matrix(ws)
+        for tbl in find_tables(grid):
             tbl.update({"sheet": s_idx + 1, "name": ws.title})
             yield tbl
 
         if not is_csv:
-            for img in _extract_images(ws, s_idx):
+            for img in extract_images(ws, s_idx):
                 yield img
+
+def extract_blocks(xls_path: str | pathlib.Path):
+    yield from iterate_spreadsheet(xls_path)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage:  python excel_xycut.py <workbook|csv>", file=sys.stderr)
+        print("Usage:  python xlsxcut.py <workbook|csv>", file=sys.stderr)
         sys.exit(1)
 
     wb_path = pathlib.Path(sys.argv[1]).expanduser()

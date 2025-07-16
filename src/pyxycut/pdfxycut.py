@@ -1,5 +1,8 @@
 import re
 import fitz
+import base64
+import sys, pathlib, json
+
 import statistics
 from statistics import median
 from collections import defaultdict
@@ -995,11 +998,10 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     if hgap:
         gy0, gy1 = hgap
 
-        # three groups inside the candidate gap’s span
         upper  = [i for i in idx if lines[i]["y1"] <= gy0]
         lower  = [i for i in idx if lines[i]["y0"] >= gy1]
-        bridge = [i for i in idx                        # rows that touch the gap
-                  if i not in upper and i not in lower  # (straddle the stripe)
+        bridge = [i for i in idx
+                  if i not in upper and i not in lower
                   and lines[i]["y0"] < gy1
                   and lines[i]["y1"] > gy0]
 
@@ -1119,10 +1121,70 @@ def iterate_chunks(page):
         table_feature_dict(page, t, page.number) for t in tbls
     ]
 
-    return table_blocks + text_blocks
+    image_blocks = []
+    doc = page.parent
+    for img in page.get_image_info(xrefs=True):
+        x0, y0, x1, y1 = img["bbox"]
+        img_width = img.get("width", 0)
+        img_height = img.get("height", 0)
+
+        skip = False
+
+        if y1 <= 0.10 * page_h or y0 >= 0.90 * page_h:
+            skip = True
+
+        if (x1 - x0) < 50 and (y1 - y0) < 50:
+            skip = True
+
+        if (x1 - x0) < 5 or (y1 - y0) < 5:
+            skip = True
+
+        if (x1 - x0) / max(1, (y1 - y0)) > 10 or (y1 - y0) / max(1, (x1 - x0)) > 10:
+            skip = True
+
+        if (x1 - x0) >= 0.9 * page_w and (y1 - y0) >= 0.9 * page_h:
+            if len(rows) > 10:
+                skip = True
+
+        if not skip:
+            xref  = img["xref"]
+            raw   = doc.extract_image(xref)
+            b64   = base64.b64encode(raw["image"]).decode()
+
+            image_blocks.append({
+                "type": "image",
+                "page": page.number + 1,
+                "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
+                "width": img_width,
+                "height": img_height,
+                "text": b64
+            })            
+
+    return table_blocks + image_blocks + text_blocks
+
+def extract_blocks(pdf_path: str | pathlib.Path):
+    with fitz.open(pdf_path) as pdf:
+        for page_no in range(pdf.page_count):
+            yield from iterate_chunks(pdf.load_page(page_no), page_no)
 
 if __name__ == "__main__":
-    import sys, pathlib, json
+    """
+    Usage
+        python3 pdfxycut.py <file.pdf> [pages]
+
+    • <file.pdf>   - required.
+    • [pages]      - optional page list (e.g. '1-3,5,9').
+    """    
+    if len(sys.argv) < 2:
+        print("usage: pdfxycut.py <file.pdf> [pages]")
+        sys.exit(1)
+
+    pdf_path  = pathlib.Path(sys.argv[1])
+    pages_arg = sys.argv[2] if len(sys.argv) >= 3 else None
+
+    if not pdf_path.exists():
+        print(f"error: file not found – {pdf_path}")
+        sys.exit(1)
 
     def parse_pages(expr, max_p):
         if expr is None:
@@ -1135,20 +1197,10 @@ if __name__ == "__main__":
                 pages.add(int(part)-1)
         return sorted(p for p in pages if 0 <= p < max_p)
 
-    arg_pdf, arg_pages = None, None
-    if len(sys.argv) >= 2:
-        if re.fullmatch(r"[\d, -]+", sys.argv[1]):
-            arg_pages = sys.argv[1]
-        else:
-            arg_pdf   = sys.argv[1]
-            if len(sys.argv) >= 3:
-                arg_pages = sys.argv[2]
-
-    pdf_path = pathlib.Path(arg_pdf or
-                            "2025Centene.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf invoice-optum.pdf
-    doc   = fitz.open(pdf_path)
-    pages = parse_pages(arg_pages, doc.page_count)
-
-    result = [{"page": p+1, "blocks": iterate_chunks(doc.load_page(p))}
-              for p in pages]
+    with fitz.open(pdf_path) as doc:
+        pages = parse_pages(pages_arg, doc.page_count)
+        result = [
+            {"page": p + 1, "blocks": iterate_chunks(doc.load_page(p))}
+            for p in pages
+        ]
     print(json.dumps(result, ensure_ascii=False, indent=2))

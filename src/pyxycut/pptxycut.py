@@ -1,12 +1,13 @@
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml import parse_xml
 from pptx.text.text import _Paragraph
 from pathlib import Path
 from collections import defaultdict
 from statistics import median, quantiles
-import statistics
+import statistics, math
 import re, json, sys
-import math
+import base64
 
 EMU_PER_PT = 914400 / 72          # 1 pt = 1/72 in ; 1 in = 914 400 EMU
 BIN_WIDTH  = 1                    # 1 pt vertical bin for gutters
@@ -17,7 +18,6 @@ TEXT_SCALE  = 0.52
 
 
 def _font_size(par: _Paragraph, default=12.0) -> float:
-    """Return the first explicit run‑font size or the paragraph default."""
     for run in par.runs:
         if run.font.size:
             return run.font.size.pt
@@ -26,11 +26,6 @@ def _font_size(par: _Paragraph, default=12.0) -> float:
     return default
 
 def _bullet_char(par: _Paragraph) -> str | None:
-    """
-    Return the glyph that PowerPoint actually draws in front of *par*
-    or None if the paragraph is not bulleted.
-    Works even when the bullet comes only from the slide‑master’s list‑style.
-    """
     ppr = parse_xml(par._pPr.xml) if par._pPr is not None else None
     if ppr is None:
         return None
@@ -45,10 +40,6 @@ def _bullet_char(par: _Paragraph) -> str | None:
     return "•"
 
 def _indent_pts(par):
-    """
-    Return the left indent of *par* in points, or 0 if not specified.
-    Compatible with all python‑pptx versions.
-    """
     fmt = getattr(par, "paragraph_format", None)
     if fmt is not None and fmt.left_indent is not None:
         try:
@@ -62,11 +53,6 @@ def _indent_pts(par):
     return 0.0
 
 def _shape_table_block(sh):
-    """
-    Convert a table shape into one JSON block:
-        {"type":"table", "bbox":[x0,y0,x1,y1], "rows":[ [...], ... ]}
-    Works with python‑pptx 0.6.0 – 0.6.23.
-    """
     tbl = sh.table
 
     n_rows = getattr(tbl, "row_count", len(tbl.rows))
@@ -91,10 +77,6 @@ def _shape_table_block(sh):
     }
 
 def _column_props(text_frame):
-    """
-    Return (col_count, col_spacing_pt) for the given TextFrame.
-    Works whether or not ``text_frame.text_frame_format`` exists.
-    """
     # 0.6.22+  -----------------------------------------------------
     fmt = getattr(text_frame, "text_frame_format", None)
     if fmt is not None:
@@ -108,31 +90,28 @@ def _column_props(text_frame):
     return max(1, cnt), spc
 
 def _column_width(shape, text_frame):
-    """
-    Width of *one* column in points, taking column spacing into account.
-    """
     cnt, spc = _column_props(text_frame)
     return (shape.width / EMU_PER_PT - (cnt - 1) * spc) / cnt, cnt, spc
 
-
-def _is_bullet_only(par: _Paragraph, txt: str) -> bool:
-    ppr = parse_xml(par._pPr.xml) if par._pPr is not None else None
-    if ppr is not None:
-        bu = ppr.find('.//a:buChar', ppr.nsmap)
-        if bu is not None and bu.get("char") == txt:
-            return True
-    return bool(BULLET_RE.fullmatch(txt))
-
 def extract_rows_from_slide(slide):
-    """
-    Yield one row dict per paragraph with tighter X‑bounds and visible bullets.
-    """
-    rows = []
-    table_blocks = []
+    rows, table_blocks, image_blocks = [], [], []
+
+    body_sizes = []
+    for sh in slide.shapes:
+        if sh.has_text_frame:
+            body_sizes.extend(_font_size(p) for p in sh.text_frame.paragraphs)
+    body_med = statistics.median(body_sizes) if body_sizes else 12.0
+
     for sh in slide.shapes:
         if sh.has_table:
             table_blocks.append(_shape_table_block(sh))
             continue
+        if sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            pic_blk = picture_block(sh, slide.part.slide_width / EMU_PER_PT,
+                                        slide.part.slide_height / EMU_PER_PT)
+            if pic_blk:
+                image_blocks.append(pic_blk)
+            continue           
         if not sh.has_text_frame:
             continue
         tf = sh.text_frame
@@ -153,17 +132,22 @@ def extract_rows_from_slide(slide):
                 continue
 
             size   = _font_size(par)
-            bullet = _bullet_char(par)
-            text   = f"{bullet} {raw}" if bullet and (not raw or raw[0] != bullet) else raw or bullet
+  
+            indent  = _indent_pts(par)
+            bullet  = _bullet_char(par)
 
-            # ---- horizontal geometry --------------------------------------
-            indent   = _indent_pts(par)
+            if bullet and indent < 2 and size <= body_med:
+                bullet = None
+
+            text = (f"{bullet} {raw}"
+                    if bullet and (not raw or raw[0] != bullet)
+                    else raw or bullet)
+
             col_idx  = min(para_idx // paras_per_col, col_cnt - 1)
             x0       = base_x + col_idx * (col_w + gutter) + indent
             est_w    = max(1, len(text)) * size * TEXT_SCALE
             x1       = min(x0 + est_w, base_x + (col_idx + 1) * col_w)
 
-            # ---- vertical geometry ----------------------------------------
             line_h = size * 1.15
             y0, y1 = y_cursor, y_cursor + line_h
             y_cursor += line_h
@@ -177,7 +161,8 @@ def extract_rows_from_slide(slide):
             })
 
     rows.sort(key=lambda r: (r["y0"], r["x0"]))
-    return rows, table_blocks
+
+    return rows, table_blocks, image_blocks
 
 def char_widths(row_list):
     w = []
@@ -213,9 +198,6 @@ def looks_like_heading(row, med_font, size_ratio=1.15, short_len=60):
 def is_large_gap(g, line_h, med_gap):
     return g >= max(ROW_FACTOR * line_h, 2.5 * med_gap if med_gap else 0)
 
-# ───────────────────────────────
-#  3.  Vertical & horizontal gap finders
-# ───────────────────────────────
 def find_vertical_gutter(rows, idx, page_w, char_w, tol=0.02):
     rx0 = min(rows[i]["x0"] for i in idx)
     rx1 = max(rows[i]["x1"] for i in idx)
@@ -275,6 +257,30 @@ def find_horizontal_gap(rows, idx, page_h, line_h, *, tol=0.02):
     g0, g1, _ = best
     return ry0 + g0*BIN_HEIGHT, ry0 + g1*BIN_HEIGHT + BIN_HEIGHT
 
+def picture_block(pic, slide_w_pt, slide_h_pt):
+    x0 = pic.left  / EMU_PER_PT
+    y0 = pic.top   / EMU_PER_PT
+    w  = pic.width  / EMU_PER_PT
+    h  = pic.height / EMU_PER_PT
+    x1, y1 = x0 + w, y0 + h
+
+    if w < 40 and h < 40:
+        return None
+    if (w / max(1, h) > 10) or (h / max(1, w) > 10):
+        return None
+    if w >= 0.9 * slide_w_pt and h >= 0.9 * slide_h_pt:
+        return None
+
+    b64 = base64.b64encode(pic.image.blob).decode()
+    return {
+        "type":   "image",
+        "bbox":   [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
+        "width":  int(w),
+        "height": int(h),
+        "text":   b64,
+    }
+
+
 # ───────────────────────────────
 #  4.  Recursive XY‑cut
 # ───────────────────────────────
@@ -323,7 +329,7 @@ def xy_cut_region(idx, rows, page_w, page_h,
                      + xy_cut_region(sorted(lower, key=lambda i: rows[i]["y0"]),
                                       rows, page_w, page_h))
 
-    # 3) heading‑boosted gap analyser
+    # 3) heading‑boosted gap analyzer
     by_top = sorted(idx, key=lambda i: rows[i]["y0"])
     med_font = statistics.median(rows[i]["size"] for i in idx)
     gaps_white, gaps_base = [], []
@@ -384,14 +390,14 @@ def make_output_chunk(seg, rows):
             "bbox":[x0,y0,x1,y1],"text":txt}
 
 def iterate_chunks_slide(slide, slide_w_pt, slide_h_pt):
-    rows, tbl_blocks = extract_rows_from_slide(slide)
+    rows, tbl_blocks, img_blocks = extract_rows_from_slide(slide)
     rows             = merge_bullets(rows)
 
     idx   = list(range(len(rows)))
     segs  = xy_cut_region(idx, rows, slide_w_pt, slide_h_pt)
     text_blocks = [make_output_chunk(seg, rows) for seg in segs if seg]
 
-    return text_blocks + tbl_blocks
+    return img_blocks + tbl_blocks + text_blocks
 
 def main(pptx_path: str):
     prs = Presentation(pptx_path)
@@ -403,8 +409,19 @@ def main(pptx_path: str):
         result.append({"page": n, "blocks": blocks})
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
+def extract_blocks(pptx_path: str | Path):
+    prs = Presentation(pptx_path)
+    slide_w = prs.slide_width  / EMU_PER_PT
+    slide_h = prs.slide_height / EMU_PER_PT
+
+    for page_no, slide in enumerate(prs.slides, 1):
+        for blk in iterate_chunks_slide(slide, slide_w, slide_h):
+            if "page" not in blk:
+                blk = {**blk, "page": page_no}
+            yield blk
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: pptx_xycut.py <file.pptx>")
+        print("usage: pptxycut.py <file.pptx>")
         sys.exit(1)
     main(sys.argv[1])

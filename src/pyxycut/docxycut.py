@@ -10,10 +10,7 @@ COL_FACTOR = 1.0
 ROW_FACTOR = 1.5
 BULLET_RE  = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 TEXT_SCALE = 0.52
-
-def _px(value):
-    """convert python‑docx Length (EMU) or int EMU to *points*"""
-    return value / EMU_PER_PT
+NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 def _font_size(par):
     for run in par.runs:
@@ -56,109 +53,152 @@ def _column_layout(section):
 
 from docx import Document
 
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt
+
+def section_column_info(section, default_space=Inches(0.5)):
+    sectPr = section._sectPr
+    cols_el = sectPr.find(qn('w:cols'))
+
+    if cols_el is None:
+        return 1, default_space.pt
+
+    num   = int(cols_el.get(qn('w:num'), 1))
+    space = cols_el.get(qn('w:space'))
+    spacing_pts = int(space) / 20.0 if space else default_space.pt
+
+    return max(1, num), spacing_pts
+
+def _table_to_rows(tbl):
+    """Return (row_cnt, col_cnt, rows_as_2D_list_of_strings) for a python-docx Table"""
+    grid = []
+    for tr in tbl.findall('.//w:tr', NS):
+        row = []
+        for tc in tr.findall('.//w:tc', NS):
+            # Collect *all* paragraphs in this cell
+            cell_txt = []
+            for p in tc.findall('.//w:p', NS):
+                texts = [t.text for t in p.findall('.//w:t', NS) if t.text]
+                if texts:
+                    cell_txt.append(''.join(texts))
+            row.append('\n'.join(cell_txt))
+        grid.append(row)
+
+    row_cnt = len(grid)
+    col_cnt = max((len(r) for r in grid), default=0)
+    for r in grid:
+        r += [''] * (col_cnt - len(r))
+    return row_cnt, col_cnt, grid
+
+import base64
+def extract_images(doc, page, column):
+    for shape in doc.inline_shapes:
+        rId  = shape._inline.graphic.graphicData.pic.blipFill.blip.embed
+        blob = doc.part.related_parts[rId].blob
+        yield {
+            "page":   page,
+            "column": column,
+            "type":   "image",
+            "bbox":   [0, 0, 0, 0],      # need real coordinates → 0 for now
+            "width":  shape.width.pt,
+            "height": shape.height.pt,
+            "text":   base64.b64encode(blob).decode(),
+        }
+
+
+from docx.enum.section import WD_SECTION_START
+
 def extract_rows_from_docx(docx_path):
-    doc = Document(docx_path)
-    rows = []
-    current_page = 1
+    doc    = Document(docx_path)
+    rows   = []
+    tables = []
+
+    current_page   = 1
     current_column = 1
-    # Determine page margins and column settings per section
-    section_cols = []  # list of (page_start, num_cols, col_width, gutter_width)
+
+    # ── gather section/column info ─────────────────────────────────────
+    section_cols = []                       # (start_page, num_cols, col_width, gutter)
     for i, section in enumerate(doc.sections):
-        num_cols = section.columns.number or 1
-        gutter = section.columns.spacing  # in inches (if available) or default
-        # Compute column width (assuming equal width columns for simplicity)
-        if num_cols > 1:
-            total_width = section.page_width - section.left_margin - section.right_margin
-            col_width = (total_width - gutter*(num_cols-1)) / num_cols
-        else:
-            col_width = section.page_width - section.left_margin - section.right_margin
-        # If section starts on new page, note the page number
-        start_page = current_page
-        # If a section has a start_type = NEW_PAGE, increment page count by 1 for that break
-        # (You might need to detect section.start_type via docx or XML)
-        if i > 0 and section.start_type == WD_SECTION.NEW_PAGE:
-            start_page += 1
-        section_cols.append((start_page, num_cols, col_width, gutter))
-    # Now iterate paragraphs and tables
+        num_cols, gutter_pts = section_column_info(section)
+        gutter   = Pt(gutter_pts)
+        total_w  = section.page_width - section.left_margin - section.right_margin
+        col_w    = (total_w - gutter*(num_cols-1)) / num_cols if num_cols > 1 else total_w
+        start_pg = current_page
+        if i > 0 and section.start_type == WD_SECTION_START.NEW_PAGE:
+            start_pg += 1
+        section_cols.append((start_pg, num_cols, col_w, gutter))
+
+    # ❶ keep a vertical cursor for each page/column
+    y_cursor = 72
+    line_h   = 14
+
     for block in doc.element.body:
+
         if block.tag.endswith('sectPr'):
-            # Section break encountered – if it's a next-page section, increment page
-            sect = block
-            if sect.xpath('.//w:type[@w:val="nextPage"]'):
+            if block.xpath('.//w:type[@w:val="nextPage"]'):
                 current_page += 1
-            # Reset column to 1 at start of new section
+                y_cursor      = 72
             current_column = 1
             continue
-        if block.tag.endswith('p'):  # paragraph
-            p = block
-            # Get all runs and texts
-            text_buffer = ""
-            for run in p.findall('.//w:r', namespaces={'w': '...'}):
-                # Check for breaks in the run
-                br = run.find('.//w:br', namespaces={'w':'...'})
-                if br is not None and br.get('{...}type') == 'column':
-                    # Column break: finalize current line as a row and start new column
-                    if text_buffer.strip():
-                        rows.append({
-                            "page": current_page,
-                            "column": current_column,
-                            "text": text_buffer.strip(),
-                            # estimate X, Y if possible...
-                        })
-                        text_buffer = ""
-                    current_column += 1  # move to next column
-                    # Reset vertical position (if tracking y, set y_cursor to top of column)
-                    # continue to next text in same paragraph (which now is column 2)
-                    continue
-                # Otherwise, handle text normally
-                t = run.find('.//w:t', namespaces={'w': '...'})
-                if t is not None:
-                    text_buffer += t.text
-            # End of paragraph – flush remaining text_buffer as a row
-            if text_buffer.strip():
-                rows.append({
-                    "page": current_page,
-                    "column": current_column,
-                    "text": text_buffer.strip(),
-                    # calculate approximate x by current_column:
-                    # x = section.left_margin + (current_column-1) * (col_width + gutter)
-                    # y = current_y_position ...
-                })
-            # After paragraph, update current_y_position += paragraph_height
-            # If paragraph has page break or section break at end, that will be caught above
-        elif block.tag.endswith('tbl'):
-            # Handle table rows similarly (omitted for brevity)
-            ...
-    return rows
 
-def cluster_rows_to_blocks(rows):
-    blocks = []
-    # Group rows by page and then by columns if present
-    for page, page_rows in groupby(sorted(rows, key=lambda r: (r["page"], r["column"], r.get("y", 0))), key=lambda r: r["page"]):
-        page_rows = list(page_rows)
-        # Detect distinct column indices on this page
-        cols = sorted({r["column"] for r in page_rows})
-        for col in cols:
-            col_rows = [r for r in page_rows if r["column"] == col]
-            # Within each column, sort by Y (top-down)
-            col_rows.sort(key=lambda r: r.get("y", 0))
-            # Now split by vertical gaps
-            block_lines = []
-            prev_y = None
-            for r in col_rows:
-                y = r.get("y", None)
-                if prev_y is not None and y is not None:
-                    # If gap between this line and previous > threshold, start a new block
-                    if y - prev_y > SOME_VERTICAL_GAP_THRESHOLD:
-                        # finalize previous block
-                        blocks.append({"page": page, "column": col, "text": "\n".join(block_lines)})
-                        block_lines = []
-                block_lines.append(r["text"])
-                prev_y = y + r.get("height", 0)  # bottom of current line
-            # flush last block in this column
-            if block_lines:
-                blocks.append({"page": page, "column": col, "text": "\n".join(block_lines)})
-    return blocks
+        # ── PARAGRAPH ──────────────────────────────────────────────────
+        if block.tag.endswith('p'):
+            from docx.text.paragraph import Paragraph 
+            para = Paragraph(block, doc)
+            text = para.text.strip()
+
+            text = ''.join(
+                t.text or '' for t in block.findall('.//w:t', NS)
+            ).strip()
+            if not text:
+                continue
+
+            # synthetic geometry  ⤵︎
+            # col_w & margins come from the *current* section:
+            # find the tuple whose start_page ≤ current_page
+            sec = max((s for s in section_cols if s[0] <= current_page),
+                      key=lambda t: t[0])
+            _, num_cols, col_w, _ = sec
+            x0 = doc.sections[0].left_margin.pt + (current_column-1)*(col_w + sec[3].pt)
+            x1 = x0 + col_w
+            y0 = y_cursor
+            y1 = y0 + line_h
+
+            rows.append({
+                "page":     current_page,
+                "column":   current_column,
+                "text":     text,
+                "x0":       x0, "x1": x1,
+                "y0":       y0, "y1": y1,
+                "size":     _font_size(para),  # crude: default to body font
+                "baseline": y1,
+                "is_bullet_only": False,
+            })
+
+            y_cursor += line_h
+            continue
+
+        # ── TABLE ──────────────────────────────────────────────────────
+        if block.tag.endswith('tbl'):
+            row_cnt, col_cnt, grid = _table_to_rows(block)
+            tables.append({
+                "page":    current_page,
+                "column":  current_column,
+                "type":    "table",
+                "bbox":    [0, 0, 0, 0],
+                "row_cnt": row_cnt,
+                "col_cnt": col_cnt,
+                "rows":    grid,
+                "text":    "",
+            })
+            y_cursor += line_h * row_cnt     # advance cursor roughly
+            continue
+
+    # ── images ─────────────────────────────────────────────────────────
+    for img in extract_images(doc, current_page, current_column):
+        tables.append(img)
+
+    return rows, tables
 
 def merge_bullets(rows, char_tol_factor=1.0):
     merged = []
@@ -387,5 +427,5 @@ if __name__ == "__main__":
     if len(sys.argv)<2:
         print("Usage: docx_xycut.py <file.docx>")
         sys.exit(1)
-    result = [{"page":1,"blocks": iterate_chunks_docx(sys.argv[1])}]
+    result = iterate_chunks_docx(sys.argv[1])
     print(json.dumps(result,indent=2,ensure_ascii=False))
