@@ -4,6 +4,19 @@ from collections import defaultdict
 import statistics, re, sys, json, math
 from statistics import median, quantiles
 
+from math import ceil
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+from docx.table import Table
+import base64, itertools, re
+
+
+EMU_TO_PT   = 1.0 / 12700                      # 1 EMU  = 1/12700 pt
+TWIP_TO_PT  = 1.0 / 20                        # 1 twip = 1/20 pt
+AVG_CHAR_W  = 0.50                            # ~½ × font‑size
+DEFAULT_LH  = 1.20                            # 1.2 × font‑size
+DEFAULT_GAP = 720                             # 720 tw = 0.5 in
+
 EMU_PER_PT = 12700
 BIN_WIDTH  = 1
 COL_FACTOR = 1.0
@@ -75,7 +88,6 @@ def _table_to_rows(tbl):
     for tr in tbl.findall('.//w:tr', NS):
         row = []
         for tc in tr.findall('.//w:tc', NS):
-            # Collect *all* paragraphs in this cell
             cell_txt = []
             for p in tc.findall('.//w:p', NS):
                 texts = [t.text for t in p.findall('.//w:t', NS) if t.text]
@@ -99,106 +111,229 @@ def extract_images(doc, page, column):
             "page":   page,
             "column": column,
             "type":   "image",
-            "bbox":   [0, 0, 0, 0],      # need real coordinates → 0 for now
+            "bbox":   [0, 0, 0, 0],
             "width":  shape.width.pt,
             "height": shape.height.pt,
             "text":   base64.b64encode(blob).decode(),
         }
 
+EMU_TO_PT   = 1.0 / 12700                      # 1 EMU  = 1/12700 pt
+TWIP_TO_PT  = 1.0 / 20                        # 1 twip = 1/20 pt
+AVG_CHAR_W  = 0.50                            # ~½ × font‑size
+DEFAULT_LH  = 1.20                            # 1.2 × font‑size
+DEFAULT_GAP = 720                             # 720 tw = 0.5 in
 
-from docx.enum.section import WD_SECTION_START
+def _iter_blocks(doc):
+    body = doc.element.body
+    for elm in body.iterchildren():
+        if elm.tag.endswith('}p'):
+            yield Paragraph(elm, doc)
+        elif elm.tag.endswith('}tbl'):
+            yield Table(elm, doc)
 
-def extract_rows_from_docx(docx_path):
-    doc    = Document(docx_path)
-    rows   = []
-    tables = []
+def _section_props(section):
+    pgW   = section.page_width
+    pgH   = section.page_height
+    top   = section.top_margin
+    bot   = section.bottom_margin
+    left  = section.left_margin
+    right = section.right_margin
 
-    current_page   = 1
-    current_column = 1
+    cols_el = section._sectPr.find(qn('w:cols'))
+    numCols = int(cols_el.get(qn('w:num'), 1)) if cols_el is not None else 1
+    if cols_el is not None and cols_el.get(qn('w:space')):
+        gapTwip = int(cols_el.get(qn('w:space')))
+    else:
+        gapTwip = DEFAULT_GAP if numCols > 1 else 0
 
-    # ── gather section/column info ─────────────────────────────────────
-    section_cols = []                       # (start_page, num_cols, col_width, gutter)
-    for i, section in enumerate(doc.sections):
-        num_cols, gutter_pts = section_column_info(section)
-        gutter   = Pt(gutter_pts)
-        total_w  = section.page_width - section.left_margin - section.right_margin
-        col_w    = (total_w - gutter*(num_cols-1)) / num_cols if num_cols > 1 else total_w
-        start_pg = current_page
-        if i > 0 and section.start_type == WD_SECTION_START.NEW_PAGE:
-            start_pg += 1
-        section_cols.append((start_pg, num_cols, col_w, gutter))
+    body_twip   = (pgW - left - right)
+    total_gap   = gapTwip * (numCols - 1)
+    colW_twip   = int((body_twip - total_gap) / max(1, numCols))
 
-    # ❶ keep a vertical cursor for each page/column
-    y_cursor = 72
-    line_h   = 14
+    to_pt = lambda L: L * EMU_TO_PT if hasattr(L, 'emu') else L.pt
+    return (
+        to_pt(pgW), to_pt(pgH),
+        to_pt(top), to_pt(bot), to_pt(left), to_pt(right),
+        numCols, gapTwip, colW_twip
+    )
 
-    for block in doc.element.body:
+def extract_rows_from_docx(path):
+    doc = Document(path)
 
-        if block.tag.endswith('sectPr'):
-            if block.xpath('.//w:type[@w:val="nextPage"]'):
-                current_page += 1
-                y_cursor      = 72
-            current_column = 1
-            continue
+    sec_iter     = itertools.chain(doc.sections, [doc.sections[-1]])  # sentinel
+    cur_section  = next(sec_iter)
+    (pgW, pgH, top, bot, left, right,
+     numCols, gapTw, colW_tw) = _section_props(cur_section)
 
-        # ── PARAGRAPH ──────────────────────────────────────────────────
-        if block.tag.endswith('p'):
-            from docx.text.paragraph import Paragraph 
-            para = Paragraph(block, doc)
-            text = para.text.strip()
+    pages        = []
+    page_no      = 1
+    col_idx      = 1
+    y_cursor     = 0.0
 
-            text = ''.join(
-                t.text or '' for t in block.findall('.//w:t', NS)
-            ).strip()
-            if not text:
-                continue
+    def new_page():
+        nonlocal page_no, col_idx, y_cursor
+        pages.append({"page": page_no, "blocks": []})
+        page_no += 1
+        col_idx  = 1
+        y_cursor = 0.0
+    new_page()
 
-            # synthetic geometry  ⤵︎
-            # col_w & margins come from the *current* section:
-            # find the tuple whose start_page ≤ current_page
-            sec = max((s for s in section_cols if s[0] <= current_page),
-                      key=lambda t: t[0])
-            _, num_cols, col_w, _ = sec
-            x0 = doc.sections[0].left_margin.pt + (current_column-1)*(col_w + sec[3].pt)
-            x1 = x0 + col_w
-            y0 = y_cursor
-            y1 = y0 + line_h
+    def _advance(block_h_pt):
+        nonlocal col_idx, y_cursor
+        usable_h = pgH - top - bot
+        if y_cursor + block_h_pt <= usable_h:
+            return
+        if col_idx < numCols:
+            col_idx += 1
+            y_cursor = 0.0
+        else:
+            pages[-1]["blocks"] and None
+            new_page()
 
-            rows.append({
-                "page":     current_page,
-                "column":   current_column,
-                "text":     text,
-                "x0":       x0, "x1": x1,
-                "y0":       y0, "y1": y1,
-                "size":     _font_size(para),  # crude: default to body font
-                "baseline": y1,
-                "is_bullet_only": False,
-            })
+    for blk in _iter_blocks(doc):
 
-            y_cursor += line_h
-            continue
+        if isinstance(blk, Paragraph):
+            sectPr = blk._p.find('.//w:sectPr', namespaces={"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"})
+            if sectPr is not None:
+                typ = sectPr.find(qn('w:type'))
+                if not (typ is not None and typ.get(qn('w:val')) == 'continuous'):
+                    new_page()
+                cur_section._sectPr = sectPr
+                (pgW, pgH, top, bot, left, right,
+                 numCols, gapTw, colW_tw) = _section_props(cur_section)
 
-        # ── TABLE ──────────────────────────────────────────────────────
-        if block.tag.endswith('tbl'):
-            row_cnt, col_cnt, grid = _table_to_rows(block)
-            tables.append({
-                "page":    current_page,
-                "column":  current_column,
+        if isinstance(blk, Table):
+            rows = [
+                ["\n".join(p.text for p in cell.paragraphs).strip()
+                 for cell in row.cells]
+                for row in blk.rows
+            ]
+            row_cnt = len(rows)
+            col_cnt = len(rows[0]) if row_cnt else 0
+
+            font_pt = blk.style.font.size.pt if blk.style and blk.style.font.size else 11
+            row_h   = font_pt * DEFAULT_LH
+            tbl_h   = row_cnt * row_h
+
+            _advance(tbl_h)
+
+            x0 = left + (col_idx-1)*(colW_tw*TWIP_TO_PT + gapTw*TWIP_TO_PT)
+            y0 = y_cursor + top
+            x1 = x0 + colW_tw*TWIP_TO_PT
+            y1 = y0 + tbl_h
+
+            pages[-1]["blocks"].append({
+                "page":    pages[-1]["page"],
+                "column":  col_idx,
                 "type":    "table",
-                "bbox":    [0, 0, 0, 0],
                 "row_cnt": row_cnt,
                 "col_cnt": col_cnt,
-                "rows":    grid,
-                "text":    "",
+                "rows":    rows,
+                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
             })
-            y_cursor += line_h * row_cnt     # advance cursor roughly
+            y_cursor += tbl_h
             continue
 
-    # ── images ─────────────────────────────────────────────────────────
-    for img in extract_images(doc, current_page, current_column):
-        tables.append(img)
+        if not isinstance(blk, Paragraph):
+            continue
 
-    return rows, tables
+        pPr          = blk.paragraph_format
+        space_before = (pPr.space_before.pt if pPr.space_before else 0.0)
+        space_after  = (pPr.space_after.pt  if pPr.space_after  else 0.0)
+        indent_left  = (pPr.left_indent.pt  if pPr.left_indent else 0.0)
+        indent_right = (pPr.right_indent.pt if pPr.right_indent else 0.0)
+        font_pt      = _font_size(blk)
+
+        bullet_only  = (
+            (blk._p.pPr is not None and blk._p.pPr.numPr is not None)  # list para
+            and not blk.text.strip()
+        ) or (re.fullmatch(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$", blk.text))
+
+        segments = []
+        buff     = ""
+
+        for run in blk.runs:
+            drawing = run._r.xpath('.//w:drawing')
+            pict    = run._r.xpath('.//w:pict')
+            if drawing or pict:
+                if buff:
+                    segments.append(("text", buff))
+                    buff = ""
+                blip = run._r.xpath('.//a:blip')
+                rel  = blip[0].get(qn('r:embed')) if blip else None
+                width_pt = height_pt = 0.0
+                ext = run._r.xpath('.//wp:extent')
+                if ext:
+                    width_pt  = int(ext[0].get('cx')) * EMU_TO_PT
+                    height_pt = int(ext[0].get('cy')) * EMU_TO_PT
+                if rel and rel in doc.part.related_parts:
+                    img_bytes = doc.part.related_parts[rel].blob
+                    img_b64   = base64.b64encode(img_bytes).decode()
+                else:
+                    img_b64 = ""
+                segments.append(("image", (img_b64, width_pt, height_pt)))
+            else:
+                buff += run.text
+        if buff or not segments:
+            segments.append(("text", buff))
+
+        for s_type, payload in segments:
+            if s_type == "text":
+                txt = payload
+                if not txt and bullet_only:
+                    txt = "•"
+                colW_pt   = colW_tw * TWIP_TO_PT - indent_left - indent_right
+                colW_pt   = max(colW_pt, 1)
+                n_chars   = max(1, len(txt.replace("\n", "")))
+                est_lines = ceil((n_chars * AVG_CHAR_W * font_pt) / colW_pt)
+                est_lines += txt.count("\n")
+                line_h    = font_pt * DEFAULT_LH
+                blk_h     = est_lines * line_h + space_before + space_after
+
+                _advance(blk_h)
+
+                x0 = left + indent_left + (col_idx-1)*(colW_tw*TWIP_TO_PT + gapTw*TWIP_TO_PT)
+                y0 = y_cursor + top + space_before
+                x1 = left + (col_idx-1)*(colW_tw*TWIP_TO_PT + gapTw*TWIP_TO_PT) + colW_tw*TWIP_TO_PT - indent_right
+                y1 = y0 + (est_lines * line_h)
+
+                pages[-1]["blocks"].append({
+                    "page":    pages[-1]["page"],
+                    "column":  col_idx,
+                    "type":    "text",
+                    "text":    txt,
+                    "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                    "font_size": font_pt,
+                    "baseline": y1,
+                    "is_bullet_only": bool(bullet_only and not payload)
+                })
+                y_cursor = (y1 - top) + space_after
+
+            elif s_type == "image":
+                img_b64, w_pt, h_pt = payload
+                if w_pt == 0 or h_pt == 0:
+                    w_pt = colW_tw * TWIP_TO_PT * 0.8
+                    h_pt = w_pt * 0.75
+
+                _advance(h_pt)
+
+                x0 = left + indent_left + (col_idx-1)*(colW_tw*TWIP_TO_PT + gapTw*TWIP_TO_PT)
+                y0 = y_cursor + top
+                x1 = x0 + w_pt
+                y1 = y0 + h_pt
+
+                pages[-1]["blocks"].append({
+                    "page":   pages[-1]["page"],
+                    "column": col_idx,
+                    "type":   "image",
+                    "text":   img_b64,
+                    "width":  w_pt,
+                    "height": h_pt,
+                    "x0": x0, "y0": y0, "x1": x1, "y1": y1
+                })
+                y_cursor += h_pt
+
+    return pages
 
 def merge_bullets(rows, char_tol_factor=1.0):
     merged = []
@@ -402,30 +537,12 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     return [idx]
 
 def iterate_chunks_docx(path):
-    rows, tables = extract_rows_from_docx(path)
-    rows = merge_bullets(rows)
-
-    pages = defaultdict(lambda: {"rows": [], "tables": []})
-    for r in rows:   pages[r["page"]]["rows"  ].append(r)
-    for t in tables: pages[t["page"]]["tables"].append(t)
-
-    out = []
-    page_w, page_h = 612, 792
-    for pg in sorted(pages):
-        rows_pg   = pages[pg]["rows"]
-        tbls_pg   = pages[pg]["tables"]
-        idx_rows  = list(range(len(rows_pg)))
-
-        segs = xy_cut_region(idx_rows, rows_pg, page_w, page_h, tbl_boxes=[])
-        text_blocks = [make_block(seg, rows_pg) for seg in segs if seg]
-
-        out.append({"page": pg, "blocks": text_blocks + tbls_pg})
-    return out
-
+    return extract_rows_from_docx(path)
 
 if __name__ == "__main__":
-    if len(sys.argv)<2:
+    if len(sys.argv) < 2:
         print("Usage: docx_xycut.py <file.docx>")
         sys.exit(1)
+
     result = iterate_chunks_docx(sys.argv[1])
-    print(json.dumps(result,indent=2,ensure_ascii=False))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
