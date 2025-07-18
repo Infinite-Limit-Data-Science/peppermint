@@ -9,7 +9,9 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from docx.table import Table
 import base64, itertools, re
-
+from docx.oxml.ns import qn
+from docx import Document
+from docx.shared import Inches
 
 EMU_TO_PT   = 1.0 / 12700                      # 1 EMU  = 1/12700 pt
 TWIP_TO_PT  = 1.0 / 20                        # 1 twip = 1/20 pt
@@ -25,49 +27,14 @@ BULLET_RE  = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 TEXT_SCALE = 0.52
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-def _font_size(par):
+
+def font_size(par):
     for run in par.runs:
         if run.font.size:
             return run.font.size.pt
     if par.style and par.style.font.size:
         return par.style.font.size.pt
     return 12.0
-
-def _is_heading(par):
-    if par.style and par.style.name.lower().startswith("heading"):
-        return True
-    return False
-
-def _bullet_char(par):
-    if par._p.pPr is None:
-        return None
-    numPr = par._p.pPr.numPr
-    if numPr is not None:
-        return "•"
-    return None
-
-from docx.oxml.ns import qn
-def _column_layout(section):
-    cols_el = getattr(section._sectPr, "cols", None)
-    if cols_el is None:
-        cols_el = section._sectPr.find(qn("w:cols"))
-
-    if cols_el is not None:
-        cnt_attr = cols_el.get(qn("w:num")) or cols_el.get("num")
-        cnt = int(cnt_attr) if cnt_attr else 1
-        spc_attr = cols_el.get(qn("w:space")) or cols_el.get("space")
-        if spc_attr:
-            spacing_pt = int(spc_attr) / 20.0
-        else:
-            spacing_pt = Pt(18).pt
-        return cnt or 1, spacing_pt
-
-    return 1, Pt(18).pt
-
-from docx import Document
-
-from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
 
 def section_column_info(section, default_space=Inches(0.5)):
     sectPr = section._sectPr
@@ -82,27 +49,6 @@ def section_column_info(section, default_space=Inches(0.5)):
 
     return max(1, num), spacing_pts
 
-def _table_to_rows(tbl):
-    """Return (row_cnt, col_cnt, rows_as_2D_list_of_strings) for a python-docx Table"""
-    grid = []
-    for tr in tbl.findall('.//w:tr', NS):
-        row = []
-        for tc in tr.findall('.//w:tc', NS):
-            cell_txt = []
-            for p in tc.findall('.//w:p', NS):
-                texts = [t.text for t in p.findall('.//w:t', NS) if t.text]
-                if texts:
-                    cell_txt.append(''.join(texts))
-            row.append('\n'.join(cell_txt))
-        grid.append(row)
-
-    row_cnt = len(grid)
-    col_cnt = max((len(r) for r in grid), default=0)
-    for r in grid:
-        r += [''] * (col_cnt - len(r))
-    return row_cnt, col_cnt, grid
-
-import base64
 def extract_images(doc, page, column):
     for shape in doc.inline_shapes:
         rId  = shape._inline.graphic.graphicData.pic.blipFill.blip.embed
@@ -116,12 +62,6 @@ def extract_images(doc, page, column):
             "height": shape.height.pt,
             "text":   base64.b64encode(blob).decode(),
         }
-
-EMU_TO_PT   = 1.0 / 12700                      # 1 EMU  = 1/12700 pt
-TWIP_TO_PT  = 1.0 / 20                        # 1 twip = 1/20 pt
-AVG_CHAR_W  = 0.50                            # ~½ × font‑size
-DEFAULT_LH  = 1.20                            # 1.2 × font‑size
-DEFAULT_GAP = 720                             # 720 tw = 0.5 in
 
 def _iter_blocks(doc):
     body = doc.element.body
@@ -242,7 +182,7 @@ def extract_rows_from_docx(path):
         space_after  = (pPr.space_after.pt  if pPr.space_after  else 0.0)
         indent_left  = (pPr.left_indent.pt  if pPr.left_indent else 0.0)
         indent_right = (pPr.right_indent.pt if pPr.right_indent else 0.0)
-        font_pt      = _font_size(blk)
+        font_pt      = font_size(blk)
 
         bullet_only  = (
             (blk._p.pPr is not None and blk._p.pPr.numPr is not None)  # list para
@@ -536,7 +476,7 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
 
     return [idx]
 
-def iterate_chunks_docx(path):
+def extract_blocks(path):
     return extract_rows_from_docx(path)
 
 if __name__ == "__main__":
@@ -544,5 +484,5 @@ if __name__ == "__main__":
         print("Usage: docx_xycut.py <file.docx>")
         sys.exit(1)
 
-    result = iterate_chunks_docx(sys.argv[1])
+    result = extract_blocks(sys.argv[1])
     print(json.dumps(result, indent=2, ensure_ascii=False))

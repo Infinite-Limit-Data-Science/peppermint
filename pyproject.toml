@@ -1,5 +1,5 @@
 [project]
-name = "pyxycut"
+name = "peppermint"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pyxycut = "pyxycut:main"
+pyxycut = "peppermint:main"
 
 [build-system]
 requires = ["hatchling"]

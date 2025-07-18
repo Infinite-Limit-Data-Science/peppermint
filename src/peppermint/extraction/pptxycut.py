@@ -77,7 +77,6 @@ def _shape_table_block(sh):
     }
 
 def _column_props(text_frame):
-    # 0.6.22+  -----------------------------------------------------
     fmt = getattr(text_frame, "text_frame_format", None)
     if fmt is not None:
         cnt = fmt.column_count or 1
@@ -282,7 +281,7 @@ def picture_block(pic, slide_w_pt, slide_h_pt):
 
 
 # ───────────────────────────────
-#  4.  Recursive XY‑cut
+#  Recursive XY‑cut
 # ───────────────────────────────
 def xy_cut_region(idx, rows, page_w, page_h,
                   *, min_block_w=0.02, min_block_h=0.02):

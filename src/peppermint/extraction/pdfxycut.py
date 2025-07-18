@@ -1,12 +1,12 @@
-import re
+import re, base64
 import fitz
+from pathlib import Path
 import statistics
 from statistics import median
 from collections import defaultdict
 from typing import List, Tuple, Dict, Iterable, Any
 
 COL_FACTOR   = 1.0
-ROW_FACTOR   = 1.5
 BIN_WIDTH    = 1
 BULLET_RE = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u00B7]+$")
 
@@ -53,19 +53,17 @@ def find_tables_fast(page) -> list[Any]:
 
         return segs
 
-    # ---------- 1) MuPDF native detector ------------------------------
     native = page.find_tables(strategy="lines", intersection_tolerance=14)
     if native and native.tables:
         if DEBUG:
             import sys
-            print(f"[page {page.number+1}] native tables: {len(native.tables)}",
+            print(f"[page {page.number+1}] native tables: {len(native.tables)}",
                   file=sys.stderr)
-        return native.tables                    # ← best quality
+        return native.tables
 
-    # ---------- 2) ruled‑frame fallback -------------------------------
     if DEBUG:
         import sys
-        print(f"[page {page.number+1}] native detector found nothing",
+        print(f"[page {page.number+1}] native detector found nothing",
               file=sys.stderr)
 
     hlines = _horiz_segments()
@@ -113,23 +111,18 @@ def find_tables_fast(page) -> list[Any]:
         print(f"   column starts ({len(col_starts)-1}): {col_starts[:-1]}",
               file=sys.stderr)
 
-    # ─── reject frames that are almost certainly NOT tables ────────────
-    # 1) only one real column detected   → looks like plain text
-    if len(col_starts) <= 2:            # note: sentinel makes it “2”
+    if len(col_starts) <= 2:            # note: sentinel makes it 2
         if DEBUG:
             print("   only one inferred column → reject", file=sys.stderr)
         return []
 
-    # 2) top & bottom horizontals must span (almost) the same width
     EPS = 5.0
     same_span = abs(top[0] - bot[0]) <= EPS and abs(top[2] - bot[2]) <= EPS
     if not same_span:
         if DEBUG:
             print("   frame edges have different spans → reject", file=sys.stderr)
         return []
-    # -------------------------------------------------------------------
     
-    # build rows
     rows_map = {}
     for w in words:
         mid_y = round(w[1], 1)
@@ -170,12 +163,6 @@ def tight_bbox_from_cells(t: "fitz.Table") -> tuple[float, float, float, float]:
     return min(xs0), min(ys0), max(xs1), max(ys1)
 
 def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
-    """
-    1. Try the native PyMuPDF extractor (works for *true* fitz.Table).
-    2. If that fails we rebuild the rows from the words that fall
-       inside tbl.bbox – this also works for the pseudo‑tables the
-       fallback detector creates.
-    """
     try:
         return tbl.extract()
     except Exception:
@@ -207,11 +194,7 @@ def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
     split_on = re.compile(r'\s{2,}')
     return [split_on.split(" ".join(r).strip()) for r in rows]
 
-def _compress_columns(rows, min_populated=2):
-    """
-    Remove columns that have fewer than `min_populated` non‑empty cells.
-    Returns a new list of rows.
-    """
+def compress_columns(rows, min_populated=2):
     if not rows:
         return rows
 
@@ -232,9 +215,149 @@ def _compress_columns(rows, min_populated=2):
     new_rows = [r for r in new_rows if any(cell and str(cell).strip() for cell in r)]
     return new_rows
 
+
+def _split_cell(cell: str | None) -> list[str]:
+    if not cell:
+        return [""]
+    return [p.strip() for p in re.split(r"[\r\n]+", str(cell)) if p.strip()]
+
+ANCHOR_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+")
+NUM_RE    = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+WS_RE     = re.compile(r"\s{2,}|[\r\n]+")
+
+def _tokenise(cell: str | None) -> list[str]:
+    if not cell:
+        return []
+    return [t.strip() for t in WS_RE.split(cell) if t.strip()]
+
+def _expand_rows(rows: list[list[str | None]]) -> list[list[str | None]]:
+    """
+    Turn any embedded line‑breaks / double‑spaces into separate physical rows,
+    keeping the table rectangular.
+    """
+    if not rows:
+        return rows
+
+    header, body = rows[0], rows[1:]
+    col_n        = len(header)
+    out          = [header]
+
+    for raw in body:
+        cols = [(c or "") for c in raw] + [""] * (col_n - len(raw))
+        tokens_per_col = [_tokenise(c) or [""] for c in cols]
+        max_len = max(len(t) for t in tokens_per_col)
+
+        for j, toks in enumerate(tokens_per_col):
+            if len(toks) < max_len:
+                toks.extend([""] * (max_len - len(toks)))
+
+        for i in range(max_len):
+            out.append([tokens_per_col[j][i] if i < len(tokens_per_col[j]) else ""
+                        for j in range(col_n)])
+    return out
+
+def _normalise_rows(rows: list[list[str | None]]) -> list[list[str | None]]:
+    """
+    • Detect anchor column (= most frequently *ANCHOR_RE*).
+    • Build item rows whenever that anchor column holds a value.
+    • Merge wrap‑around lines (anchor empty, not a summary).
+    • Append summary rows (= anchor empty & right‑most cell numeric & ≤2 cells).
+    • Stop when first non‑summary line is found *after* summary section.
+    """
+    if not rows: 
+        return rows
+
+    header, body = rows[0], rows[1:]
+    col_n        = len(header)
+
+    # 1. anchor column = column with most anchor‑like numbers
+    hits = [0]*col_n
+    for r in body:
+        for j,c in enumerate(r):
+            if c and ANCHOR_RE.fullmatch(c.strip()):
+                hits[j] += 1
+    anchor = hits.index(max(hits)) if any(hits) else 0
+
+    clean : list[list[str|None]] = [header]
+    in_summary = False
+
+    for raw in body:
+        row = [(c or "").strip() for c in raw] + [""]*(col_n-len(raw))
+        anchor_val = row[anchor]
+
+        non_empty  = [j for j,c in enumerate(row) if c]
+        right_num  = bool(non_empty and NUM_RE.fullmatch(row[non_empty[-1]]))
+        is_anchor  = bool(ANCHOR_RE.fullmatch(anchor_val))
+        is_summary = (not anchor_val and right_num and len(non_empty)<=2)
+
+        # ---- termination rule ----
+        if in_summary and not is_summary:
+            break        # anything after the summary section is outside the table
+
+        if is_anchor:                    # new item row
+            clean.append([c or None for c in row])
+        elif is_summary:                 # first or subsequent summary row
+            clean.append([c or None for c in row])
+            in_summary = True
+        else:                            # continuation line → merge
+            if len(clean) == 1:          # stray line before first anchor; skip
+                continue
+            prev = clean[-1]
+            for j,c in enumerate(row):
+                if c:
+                    sep = " " if prev[j] else ""
+                    prev[j] = (prev[j] or "") + sep + c
+
+    return clean
+
+def merge_wraps(rows: list[list[str | None]]) -> list[list[str | None]]:
+    if not rows:
+        return rows
+
+    header, body = rows[0], rows[1:]
+    col_n = len(header)
+
+    num_hits = [0] * col_n
+    for r in body:
+        for j, c in enumerate(r):
+            if c is not None and NUM_RE.match(str(c)):
+                num_hits[j] += 1
+    anchor = num_hits.index(max(num_hits)) if any(num_hits) else 0
+
+    merged: list[list[str | None]] = [header]
+
+    for raw in body:
+        row = [(c if c is not None else "") for c in raw] + [""] * (col_n - len(raw))
+
+        anchor_val     = row[anchor]
+        non_empty_idx  = [j for j, c in enumerate(row) if c.strip()]
+        rightmost_num  = max((j for j in non_empty_idx if NUM_RE.match(row[j])), default=-1)
+
+        is_anchor_num  = bool(NUM_RE.match(anchor_val))
+        looks_summary  = (not anchor_val.strip()
+                          and len(non_empty_idx) <= 2
+                          and rightmost_num == col_n - 1)
+
+        if is_anchor_num or looks_summary or len(merged) == 1:
+            merged.append(row)
+        else:
+            prev = merged[-1]
+            for j, c in enumerate(row):
+                if c.strip():
+                    prev[j] = (prev[j] or "") + (" " if prev[j] else "") + c
+                    prev[j] = prev[j].strip()
+
+    for r in merged:
+        for j, c in enumerate(r):
+            if c == "":
+                r[j] = None
+
+    return merged
+
 def table_feature_dict(page: fitz.Page, tbl: "fitz.Table", pno: int) -> dict:
     rows = rows_from_table(page, tbl)
-    rows = _compress_columns(rows, min_populated=2)
+    rows = _expand_rows(rows)
+    rows = _normalise_rows(rows)
     
     return {
         "type":    "table",
@@ -251,38 +374,123 @@ def in_any_table(x0, y0, x1, y1, tbl_boxes):
     return any(x0b <= cx <= x1b and y0b <= cy <= y1b for
                x0b, y0b, x1b, y1b in tbl_boxes)
 
+def add_page_bbox(block: dict, page_rect) -> dict:
+    block["page_x0"] = float(page_rect.x0)
+    block["page_y0"] = float(page_rect.y0)
+    block["page_x1"] = float(page_rect.x1)
+    block["page_y1"] = float(page_rect.y1)
+    return block
+
+def _median_plus_mad(values: List[float], k: float = 1.5) -> float:
+    if not values:
+        return 0.0
+    med = statistics.median(values)
+    mad = statistics.median(abs(v - med) for v in values)
+    return med + k * mad
+
+def compute_page_gap_stats(rows: List[Dict]) -> tuple[float, float]:
+    if len(rows) <= 1:
+        return 9999.0, 0.0
+
+    by_top   = sorted(rows, key=lambda r: r["y0"])
+    gaps     = [by_top[i+1]["y0"] - by_top[i]["y0"]
+                for i in range(len(by_top) - 1)]
+    gaps     = [g for g in gaps if g > 0]
+    gaps.sort()
+
+    if not gaps:
+        return 9999.0, 0.0
+
+    jump_idx, jump_ratio = None, 1.0
+    for i in range(1, len(gaps)):
+        if gaps[i-1] == 0:
+            continue
+        ratio = gaps[i] / gaps[i-1]
+        if ratio > jump_ratio:
+            jump_ratio, jump_idx = ratio, i
+
+    page_abs_thr = _median_plus_mad(gaps, k=1.5)
+
+    # 75‑th percentile for the relative rule
+    k75 = int(0.75 * (len(gaps) - 1))
+    page_p75_gap = gaps[k75]
+
+    return page_abs_thr, page_p75_gap
+
+def region_threshold(idx: List[int],
+                     lines: List[dict],
+                     *,
+                     page_abs_thr: float,
+                     page_p75_gap: float,
+                     jump_ratio_req: float = 1.35,
+                     cap_mult: float = 3.0
+                     ) -> Tuple[float, float]:
+
+    if len(idx) < 6:
+        return page_abs_thr, page_p75_gap
+
+    by_top = sorted(idx, key=lambda i: lines[i]["y0"])
+    gaps   = [lines[b]["y0"] - lines[a]["y0"]
+              for a, b in zip(by_top, by_top[1:])
+              if lines[b]["y0"] > lines[a]["y0"]]
+
+    if not gaps:
+        return page_abs_thr, page_p75_gap
+
+    gaps.sort()
+ 
+
+    local_abs = _median_plus_mad(gaps, k=1.5)
+
+    # 2.  safety‑cap against ridiculous values
+    med_gap = statistics.median(gaps)
+    local_abs = min(local_abs, med_gap * cap_mult)
+
+    # 3.  local 75‑th percentile
+    k75      = int(0.75 * (len(gaps) - 1))
+    local_p75 = gaps[k75]
+
+    return local_abs, local_p75
+
+def merge_adjacent_blocks(
+        blocks: List[Dict],
+        *,
+        page_abs_thr: float,
+        page_p75_gap: float,
+        cap_mult: float   = 3.0,
+        min_horiz_overlap: float = 0.50
+) -> List[Dict]:
+    if len(blocks) <= 1:
+        return blocks
+
+    merged: List[Dict] = [blocks[0]]
+
+    merge_abs_thr = min(page_abs_thr, page_p75_gap * cap_mult)
+
+    for blk in blocks[1:]:
+        cur = merged[-1]
+
+        v_gap = blk["bbox"][1] - cur["last_baseline"]
+        overlap = min(cur["bbox"][2], blk["bbox"][2]) - max(cur["bbox"][0],
+                                                            blk["bbox"][0])
+        min_width = min(cur["bbox"][2] - cur["bbox"][0],
+                        blk["bbox"][2] - blk["bbox"][0])
+        h_ratio = overlap / min_width if min_width > 0 else 0.0
+
+        if v_gap < merge_abs_thr and h_ratio >= min_horiz_overlap:
+            cur["text"] = cur["text"].rstrip() + " " + blk["text"].lstrip()
+            cur["bbox"][0] = min(cur["bbox"][0], blk["bbox"][0])
+            cur["bbox"][2] = max(cur["bbox"][2], blk["bbox"][2])
+            cur["bbox"][3] = blk["bbox"][3]
+            cur["last_baseline"] = blk["last_baseline"]
+        else:
+            merged.append(blk)
+
+    return merged
+
+
+
 def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
-    """
-    Return one dictionary **per physical baseline** on the page.
-
-    ── PDF text hierarchy handled here ─────────────────────────────
-    • Block  - PyMuPDF “paragraph-level” unit, inferred from layout.
-    • Line   - all glyphs that share the *same baseline* inside a block.
-               A single baseline can mix styles, so PyMuPDF breaks it
-               into multiple *spans* while keeping one common bbox.
-    • Span   - a consecutive run of glyphs that share identical font
-               family, size, style, colour, writing direction, etc.
-
-      ┌─ Example:  “The  quick  bold  brown  fox”
-      │            └────┬────────────────────────── same line/baseline
-      │                 │
-      │        regular-face span(s)      bold-face span
-      └─────────────────────────────────────────────────────────────
-
-    Because one line may contain several spans, we compute the line’s
-    *dominant* font size as the statistical mode of its span sizes
-    (most common size across all spans).  This baseline-level record
-    is later combined with word-level data for gap detection, bullets,
-    and XY-cut segmentation.
-
-    Returns
-    -------
-    List[Dict]
-        Each dict contains:
-        • bbox      - (x0, y0, x1, y1) of the line
-        • spans     - raw span list for debugging
-        • fontsize  - dominant font size (float, points)
-    """
     blocks = page.get_text("dict")["blocks"]
     lines = []
     for blk in blocks:
@@ -302,54 +510,6 @@ def extract_baseline_lines(page: fitz.Page) -> List[Dict]:
 
 
 def bucket_words_by_baseline(page: fitz.Page, y_tol: float = 0.5) -> Dict[float, List[Dict]]:
-    """
-    Group every *word* on the page into buckets keyed by a quantized baseline
-    (Y₀ coordinate).
-        - Look at every word on the page.
-        - PyMuPDF hands each word to you with its position: (left x, top y, right x, bottom y, text, …)
-        - Give each word a “line-ID”.
-
-    ── Source granularity ─────────────────────────────────────────────
-    Uses ``page.get_text("words")`` which yields one tuple **per word**:
-        (x0, y0, x1, y1, text, block_no, line_no, word_no)
-
-    ── What “baseline bucketing” means ───────────────────────────────
-    • Words whose top-left Y₀ differs by ≤ *y_tol* points are considered to
-      lie on the *same* physical baseline.   
-    • The key is ``round(y0 / y_tol) * y_tol`` – a small grid that absorbs
-      minor anti-aliasing / hinting noise.
-
-    ── Output structure ──────────────────────────────────────────────
-    {
-        baseline_y : [                                 # sorted left→right
-            {
-                "bbox"  : (x0, y0, x1, y1),            # word rectangle
-                "text"  : "The",
-                "x0"    : x0,                          # cached for speed
-                "x1"    : x1,
-                "height": y1 - y0
-            },
-            …
-        ],
-        …
-    }
-
-    This fast lookup table is later consumed by ``split_physical_line`` and
-    column / gutter logic that require precise word-level gaps on a given
-    baseline.
-
-    Parameters
-    ----------
-    page : fitz.Page
-        Page from which to extract word tuples.
-    y_tol : float, default 0.5 pt
-        Quantisation quantum for baseline grouping.
-
-    Returns
-    -------
-    Dict[float, List[Dict]]
-        Maps each quantised baseline to its left-to-right list of words.
-    """
     words = page.get_text("words")
     buckets: Dict[float, List[Dict]] = defaultdict(list)
     for w in words:
@@ -385,60 +545,6 @@ def split_baseline_into_chunks(
     line_words: List[Dict],
     gap_factor: float = 2.5,
 ) -> List[Dict]:
-    """
-    Break one **printed baseline** into smaller “logical rows” whenever a
-    *visually large* horizontal blank separates consecutive words.
-
-    Parameters
-    ----------
-    baseline_meta : Dict
-        The record produced by ``extract_baseline_lines`` for this baseline.
-        It already contains:
-            • bbox      – bounding-box for the *whole* baseline
-            • fontsize  – dominant font size on that baseline
-    words_on_baseline : List[Dict]
-        All word-level dicts that share this baseline, supplied by
-        ``bucket_words_by_baseline`` (each has x0, x1, bbox, text, …).  The
-        list **must be pre-sorted left→right**.
-    gap_factor : float, default 2.5
-        A horizontal gap is considered “large” if it is at least
-        ``gap_factor × median_character_width``.  Increase to split less,
-        decrease to split more aggressively.
-
-    Returns
-    -------
-    List[Dict]
-        Zero or more chunk dicts, each representing **one logical row**
-        printed on the same baseline but separated by a large gap.  Every
-        chunk contains:
-            • bbox      – union of its words
-            • text      – concatenation of its words with single spaces
-            • fontsize  – copied from *baseline_meta*
-            • baseline  – y-coordinate of this baseline (top of bbox)
-
-    Why this matters
-    ----------------
-    PDFs often place two semantically distinct items on the same baseline:
-
-        ▪ “• Apples       • Oranges”
-        ▪ “Name     Price”
-        ▪ “Premium:        $400”
-
-    Treating the entire baseline as one string would lose that structure.
-    By detecting unusually wide gaps (scaled by character width) we preserve
-    bullet lists, key-value pairs, and pseudo-columns for later layout
-    analysis.
-
-    Algorithm
-    ---------
-    1. Compute the median **character width** on this baseline:
-           w_char_med = median( (x1−x0)/len(text) for each word )
-    2. Define a threshold:
-           gap_threshold = gap_factor × w_char_med
-    3. Scan words left→right; whenever the white-space between *prev* and
-       *curr* (``curr.x0 − prev.x1``) ≥ gap_threshold, start a new chunk.
-    4. For every chunk, build the bounding box and join the text.
-    """
     if not line_words:
         if DEBUG:
             print(f"[DROP] baseline {line['bbox'][1]:.2f} – "
@@ -477,10 +583,6 @@ def split_baseline_into_chunks(
     return logical
 
 def split_and_tag_lines(page: fitz.Page) -> List[Dict]:
-    """
-    Runs the full baseline → words mapping + sub‑line splitting.
-    Adds field 'is_bullet_only' to each logical chunk.
-    """
     lines = extract_baseline_lines(page)
     word_buckets = bucket_words_by_baseline(page)
 
@@ -588,74 +690,6 @@ def compute_dominant_sizes(lines: List[dict]) -> Tuple[float, float]:
     return char, statistics.median(core)
 
 def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
-    """
-    Detect a **mostly empty vertical stripe** (a “gutter”) inside the region
-    spanned by the rows indexed in *idx*.  Such a gutter is strong evidence
-    of a multi-column layout, and `xy_cut_region` will split on it before
-    attempting any horizontal cuts.
-
-    Parameters
-    ----------
-    lines : List[Dict]
-        All pre-processed row dictionaries for the current page (output of
-        `preprocess_page`).  Only geometry fields (`x0, x1`) are used here.
-    idx : List[int]
-        Indices of the rows that form the *current* rectangular region under
-        consideration.  We try to find a gutter **only inside this subset**.
-    page_w : float
-        Full page width, needed for a sanity check that prevents splitting
-        off unreasonably narrow columns.
-    char_w : float
-        Median character width for this region (obtained from
-        `compute_dominant_sizes`).  The minimum gutter width is scaled by
-        this value so “one character wide” on a small font is still accepted.
-    tol : float, default 0.02
-        Maximum fraction of rows that may *touch* the candidate gutter
-        (default 2 %).  Allows a few overhanging headlines or images without
-        cancelling the split.
-
-    Returns
-    -------
-    Optional[Tuple[float, float]]
-        `(gx0, gx1)` – left and right x-coordinates of the gutter in page
-        space – if a suitable stripe is found; otherwise `None`.
-
-    How the algorithm works
-    -----------------------
-    1. **Restrict the search** to the horizontal span that encloses all rows
-       in *idx* (`rx0 … rx1`).  Work entirely within that mini-rectangle.
-
-    2. **Discretise** that span into 1 pt-wide vertical bins
-       (`BIN_WIDTH = 1`).  For every row, mark all bins it overlaps.  The
-       result is a histogram `hist[b]` counting “how many rows touch this
-       bin?”
-
-    3. **Thresholds**  
-       • *max_occ* = `max(1, tol × len(idx))`  
-         → bins touched by no more than ~ 2 % of rows are “sufficiently
-         empty”.  
-       • *run_req* = `max(1, int(COL_FACTOR × char_w / BIN_WIDTH))`  
-         → the gutter must span at least one **character width** of empty
-         bins.
-
-    4. **Scan the histogram** looking for the *longest* consecutive run of
-       low-occupancy bins (≤ *max_occ*).  Store the best run.
-
-    5. **Return** the page-x coordinates of that run if it meets
-       *run_req*; else return `None`.
-
-    6. **Safety check in `xy_cut_region`**  
-       Even when a gutter is reported, the caller confirms both resulting
-       sub-regions are wider than `min_block_width × page_w` to avoid bogus
-       splits on accidental white-space.
-
-    Practical outcome
-    -----------------
-    For two-column documents, the gutter is the white channel between
-    columns; for key-value layouts it can be the wide gap after the keys.
-    Detecting it early lets XY-Cut recurse **left → middle-bridge → right**
-    instead of slicing horizontally first.
-    """
     rx0 = min(lines[i]["x0"] for i in idx)
     rx1 = max(lines[i]["x1"] for i in idx)
     w   = rx1 - rx0
@@ -685,32 +719,6 @@ def find_vertical_gutter(lines, idx, page_w, char_w, tol=0.02):
     return rx0 + g0*BIN_WIDTH, rx0 + g1*BIN_WIDTH + BIN_WIDTH
 
 def gap(a: Dict, b: Dict) -> float:
-    """
-    Measure the **vertical white-space** between two printed rows.
-
-    Parameters
-    ----------
-    a, b : Dict
-        Row dictionaries that already carry absolute page coordinates:
-        • ``y0`` – top edge of the row (baseline-aligned in PyMuPDF)
-        • ``y1`` – bottom edge of the row
-
-    Returns
-    -------
-    float
-        • **> 0.0**  → the rows are separated by that many points of blank paper  
-        • **0.0**    → the rows touch or overlap (negative distances are clamped)
-
-    Notes
-    -----
-    ``b["y0"] - a["y1"]`` gives the raw distance from the bottom of *row a*
-    to the top of *row b*.  Wrapping the result in ``max(0.0, …)`` normalises
-    all *touching / overlapping* cases to **“no gap” = 0.0** so later logic
-    can focus on *large enough* gaps without worrying about negative values.
-
-    This helper is the primitive that higher-level heuristics
-    (median-gap estimates, heading boosts, XY-cut recursion) build upon.
-    """
     return max(0.0, b["y0"] - a["y1"])
 
 def looks_like_heading(row: Dict,
@@ -718,10 +726,8 @@ def looks_like_heading(row: Dict,
                        *,
                        size_ratio: float = 1.15,
                        short_len: int = 60) -> bool:
-    """Return True for rows that look like a heading or sub‑heading."""
     text = row["text"].strip()
 
-    # NEW: must contain at least one letter → excludes "• •" lines
     if not any(ch.isalpha() for ch in text):
         return False
 
@@ -729,25 +735,16 @@ def looks_like_heading(row: Dict,
     short_text = len(text) <= short_len
     return big_enough and short_text
 
-def is_large_gap(g: float, line_h: float, med_gap: float) -> bool:
-    thresh_abs = ROW_FACTOR * line_h
-    thresh_rel = 2.5 * med_gap if med_gap else 0
-    return g >= max(thresh_abs, thresh_rel)
+def is_large_gap(g: float, *, abs_thr: float, p75_gap: float, rel_mult: float = 1.10) -> bool:
+    if p75_gap == 0:
+        return g >= abs_thr
+    return g >= abs_thr and g >= rel_mult * p75_gap
 
-def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
-    """
-    Look for a mostly empty horizontal stripe between the rows in *idx*.
-
-    Returns
-    -------
-    Optional[Tuple[float, float]]
-        (gy0, gy1) – top & bottom Y of the gap in page coordinates –  
-        or None if no sufficiently wide / clean stripe exists.
-    """
+def find_horizontal_gap(lines, idx, *, run_req_pt: float, tol: float = 0.02):
     ry0 = min(lines[i]["y0"] for i in idx)
     ry1 = max(lines[i]["y1"] for i in idx)
     h   = ry1 - ry0
-    if h <= 0 or line_h == 0:
+    if h <= 0:
         return None
 
     BIN_HEIGHT = 1
@@ -762,7 +759,7 @@ def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
             hist[b] += 1
 
     max_occ = max(1, int(tol * len(idx)))
-    run_req = max(1, int((ROW_FACTOR * line_h) // BIN_HEIGHT))
+    run_req = max(1, int(run_req_pt // BIN_HEIGHT))
 
     best = None; cur = None
     for j, occ in enumerate(hist + [max_occ + 1]):
@@ -781,22 +778,13 @@ def find_horizontal_gap(lines, idx, page_h, line_h, *, tol=0.02):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Main recursive XY‑cut
+#  recursive XY‑cut algorithm
 # ──────────────────────────────────────────────────────────────────────────────
 def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
-                  *, min_block_width=0.02, min_block_height=0.02):
-    """
-    Split the region that consists of rows *idx* until no significant
-    vertical (column) **or** horizontal (paragraph) whitespace remains.
-
-    Returns
-    -------
-    List[List[int]]
-        A list of “leaf” segments, each being the list of row indices
-        that belong to one output text block.
-    """
+                  *, page_abs_thr: float, page_p75_gap: float,
+                  min_block_width=0.02, min_block_height=0.02):
     global xy_cut_region_depth
-
+    
     if not idx or len(idx) == 1:
         return [idx]
     
@@ -807,7 +795,6 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
               f"rows={len(idx):3d}  span=({first:.1f} … {last:.1f})")
     xy_cut_region_depth += 1
 
-    # ── exclude rows that sit inside user‑supplied table boxes ──────────────
     def in_table(ln):
         cx = (ln["x0"] + ln["x1"]) / 2
         cy = (ln["y0"] + ln["y1"]) / 2
@@ -819,8 +806,23 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
     )
     if char_w == 0 or line_h == 0:
         return [idx]
+    
+    region_abs, region_p75 = region_threshold(
+        idx, lines,
+        page_abs_thr=page_abs_thr,
+        page_p75_gap=page_p75_gap
+    )
 
-    # ── 1) try vertical split (classic XY‑cut) ──────────────────────────────
+    use_region = len(idx) >= 6 and region_abs < page_abs_thr * 0.95
+    abs_thr    = region_abs   if use_region else page_abs_thr
+    p75_gap    = region_p75   if use_region else page_p75_gap
+
+    if DEBUG:
+        print(f"[XY] depth={xy_cut_region_depth:2d}  "
+            f"abs_thr={abs_thr:4.1f}  p75={p75_gap:4.1f}  "
+            f"rows={len(idx):3d}")
+
+    # ── 1) vertical split ──────────────────────────────
     gutter = find_vertical_gutter(lines, idx, page_w, char_w)
     if gutter:
         gx0, gx1 = gutter
@@ -836,31 +838,38 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
             if l_w >= min_w and r_w >= min_w:
                 return (xy_cut_region(sorted(left,  key=lambda i: lines[i]["y0"]),
                                       lines, page_w, page_h, tbl_boxes,
+                                      page_abs_thr=abs_thr,
+                                      page_p75_gap=p75_gap,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height)
                      + xy_cut_region(sorted(bridge,key=lambda i: lines[i]["y0"]),
                                       lines, page_w, page_h, tbl_boxes,
+                                      page_abs_thr=abs_thr,
+                                      page_p75_gap=p75_gap,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height)
                      + xy_cut_region(sorted(right, key=lambda i: lines[i]["y0"]),
                                       lines, page_w, page_h, tbl_boxes,
+                                      page_abs_thr=abs_thr,
+                                      page_p75_gap=p75_gap,
                                       min_block_width=min_block_width,
                                       min_block_height=min_block_height))
 
-    # ── 2) try *horizontal* split (new branch) ──────────────────────────────
-    hgap = find_horizontal_gap(lines, idx, page_h, line_h)
+    # ── 2) *horizontal* split ──────────────────────────────
+    hgap = find_horizontal_gap(lines, idx,
+                           run_req_pt = abs_thr,
+                           tol = 0.02)
     if hgap:
         gy0, gy1 = hgap
 
-        # three groups inside the candidate gap’s span
         upper  = [i for i in idx if lines[i]["y1"] <= gy0]
         lower  = [i for i in idx if lines[i]["y0"] >= gy1]
-        bridge = [i for i in idx                        # rows that touch the gap
-                  if i not in upper and i not in lower  # (straddle the stripe)
+        bridge = [i for i in idx
+                  if i not in upper and i not in lower
                   and lines[i]["y0"] < gy1
                   and lines[i]["y1"] > gy0]
 
-        if upper and lower:                                    # sane split?
+        if upper and lower:
             min_h = min_block_height * page_h
             u_h   = max(lines[i]["y1"] for i in upper) - min(lines[i]["y0"] for i in upper)
             l_h   = max(lines[i]["y1"] for i in lower) - min(lines[i]["y0"] for i in lower)
@@ -870,54 +879,61 @@ def xy_cut_region(idx, lines, page_w, page_h, tbl_boxes,
                     # recurse on the *upper* chunk
                     xy_cut_region(sorted(upper,  key=lambda i: lines[i]["y0"]),
                                    lines, page_w, page_h, tbl_boxes,
+                                   page_abs_thr=abs_thr,
+                                   page_p75_gap=p75_gap,
                                    min_block_width=min_block_width,
                                    min_block_height=min_block_height)
                   + # recurse on rows that straddled the gap
                     xy_cut_region(sorted(bridge, key=lambda i: lines[i]["y0"]),
                                    lines, page_w, page_h, tbl_boxes,
+                                   page_abs_thr=abs_thr,
+                                   page_p75_gap=p75_gap,
                                    min_block_width=min_block_width,
                                    min_block_height=min_block_height)
                   + # recurse on the *lower* chunk
                     xy_cut_region(sorted(lower,  key=lambda i: lines[i]["y0"]),
                                    lines, page_w, page_h, tbl_boxes,
+                                   page_abs_thr=abs_thr,
+                                   page_p75_gap=p75_gap,
                                    min_block_width=min_block_width,
                                    min_block_height=min_block_height)
                 )
 
     by_top   = sorted(idx, key=lambda i: lines[i]["y0"])
-    med_font = statistics.median(lines[i]["size"] for i in idx)
 
-    gaps_white  = [] 
-    gaps_base   = [] 
-    gaps = []
-    for a, b in zip(by_top, by_top[1:]):
-        white_gap = gap(lines[a], lines[b])
-        base_gap  = lines[b]["y0"] - lines[a]["y0"]
+    gaps_base = [lines[b]["y0"] - lines[a]["y0"]
+                 for a, b in zip(by_top, by_top[1:])]
 
-        # heading → boost gap artificially
-        if looks_like_heading(lines[a], med_font) or looks_like_heading(lines[b], med_font):
-            base_gap = max(base_gap, ROW_FACTOR * line_h + 1)
-        gaps_white.append(white_gap)
-        gaps_base.append(base_gap)
-
-    med_gap = statistics.median(gaps_white) if gaps_white else 0
-    gaps    = gaps_base
+    rel_mult = 1.10
+    if DEBUG:
+        for k, g in enumerate(gaps_base):
+            flag = is_large_gap(g, abs_thr=abs_thr, p75_gap=p75_gap)
+            print(f"[GAP] k={k:3d}  g={g:5.1f}  "
+                  f"abs_thr={abs_thr:5.1f}  "
+                  f"rel_thr={rel_mult*p75_gap:5.1f}  "
+                  f"large? {flag}")
 
     big = [k for k, g in enumerate(gaps_base)
-           if is_large_gap(g, line_h, med_gap)]
+           if is_large_gap(g,
+                           abs_thr=abs_thr,
+                           p75_gap=p75_gap,
+                           rel_mult=rel_mult)]
 
     if big:
-        split_pos = max(big, key=lambda k: gaps[k]) + 1
+        split_pos = max(big, key=lambda k: gaps_base[k]) + 1
         upper = by_top[:split_pos]
         lower = by_top[split_pos:]
         return (xy_cut_region(upper, lines, page_w, page_h, tbl_boxes,
+                              page_abs_thr=abs_thr,
+                              page_p75_gap=p75_gap,
                               min_block_width=min_block_width,
                               min_block_height=min_block_height)
              + xy_cut_region(lower, lines, page_w, page_h, tbl_boxes,
+                              page_abs_thr=abs_thr,
+                              page_p75_gap=p75_gap,
                               min_block_width=min_block_width,
                               min_block_height=min_block_height))
 
-    # ── 4) nothing to cut – return the current region ──────────────────────
     return [idx]
 
 def make_output_chunk(seg: List[int], rows: List[Dict]) -> Dict:
@@ -934,27 +950,98 @@ def make_output_chunk(seg: List[int], rows: List[Dict]) -> Dict:
         "type": "text",
         "font_size": round(font, 2),
         "bbox": [x0, y0, x1, y1],
+        "last_baseline": max(rows[i]["y0"] for i in seg),
         "text": text,
     }
+
+def pixmap_base64(doc: fitz.Document, xref: int) -> str:
+    try:
+        pm = fitz.Pixmap(doc, xref)
+        if pm.n > 4:  # convert CMYK / GRAY+ALPHA → RGB
+            pm = fitz.Pixmap(fitz.csRGB, pm)
+        return base64.b64encode(pm.tobytes("png")).decode()
+    except Exception:
+        return ""
+
+def extract_images_from_page(page: fitz.Page) -> list[dict]:
+    doc = page.parent
+    img_blocks = []
+    seen_rects = set()
+
+    for img in page.get_images(full=True):
+        xref, smask, width, height, bpc, cs, alt_cs, name, *_ = img
+
+        for rect in page.get_image_rects(xref):
+            key = (
+                xref,
+                round(rect.x0, 3),
+                round(rect.y0, 3),
+                round(rect.x1, 3),
+                round(rect.y1, 3),
+            )
+            if key in seen_rects:
+                continue
+            seen_rects.add(key)
+
+            img_blocks.append({
+                "type":   "image",
+                "page":   page.number + 1,
+                "bbox":   [
+                    float(rect.x0), float(rect.y0),
+                    float(rect.x1), float(rect.y1)
+                ],
+                "width":  width,
+                "height": height,
+                "text":   pixmap_base64(doc, xref),
+            })
+
+    return img_blocks
+
 
 def iterate_chunks(page):
     tbls       = find_tables_fast(page)
     tbl_boxes  = [t.bbox for t in tbls]
 
     rows   = preprocess_page(page, tbl_boxes)
+    rows = [r for r in rows
+            if not in_any_table(r["x0"], r["y0"],
+                                r["x1"], r["y1"], tbl_boxes)]
+    
+    page_abs_thr, page_p75_gap = compute_page_gap_stats(rows)
+    if DEBUG:
+        print(f"[PAGE] abs_thr={page_abs_thr:.2f}  "
+              f"p75_gap={page_p75_gap:.2f}")
+
     idx    = list(range(len(rows)))
     page_w, page_h = page.rect.width, page.rect.height
 
-    segs = xy_cut_region(idx, rows, page_w, page_h,
-                         tbl_boxes, min_block_width=0.02)
+    segs = xy_cut_region(idx, rows, page_w, page_h, tbl_boxes,
+                         page_abs_thr=page_abs_thr,
+                         page_p75_gap=page_p75_gap,
+                         min_block_width=0.02)
 
     text_blocks = [make_output_chunk(seg, rows) for seg in segs if seg]
+    text_blocks = merge_adjacent_blocks(text_blocks,
+                                        page_abs_thr=page_abs_thr,
+                                        page_p75_gap=page_p75_gap)
 
     table_blocks = [
         table_feature_dict(page, t, page.number) for t in tbls
     ]
 
-    return table_blocks + text_blocks
+    image_blocks = extract_images_from_page(page)
+
+    page_rect = page.rect
+    table_blocks = [add_page_bbox(b, page_rect) for b in table_blocks]
+    image_blocks = [add_page_bbox(b, page_rect) for b in image_blocks]
+    text_blocks  = [add_page_bbox(b, page_rect) for b in text_blocks]
+    
+    return table_blocks + image_blocks + text_blocks
+
+def extract_blocks(pdf_path: str | Path):
+    with fitz.open(pdf_path) as pdf:
+        for page_no in range(pdf.page_count):
+            yield from iterate_chunks(pdf.load_page(page_no), page_no)
 
 if __name__ == "__main__":
     import sys, pathlib, json
@@ -979,8 +1066,7 @@ if __name__ == "__main__":
             if len(sys.argv) >= 3:
                 arg_pages = sys.argv[2]
 
-    pdf_path = pathlib.Path(arg_pdf or
-                            "25M06-02C.pdf") # 2024-Artificial-empathy-in-healthcare-chatbots.pdf 2025Centene.pdf 64654-genesys.pdf 25M06-02C.pdf
+    pdf_path = pathlib.Path(arg_pdf)
     doc   = fitz.open(pdf_path)
     pages = parse_pages(arg_pages, doc.page_count)
 

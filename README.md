@@ -165,3 +165,40 @@ Compare the candidate gap g with this data‑driven threshold rather than with R
 
 
 
+What the code does today
+compute_page_gap_stats() (once per page)
+
+Scans all baselines on the page.
+
+Returns a page‑level absolute gap threshold (page_abs_thr) and the page‑level 75‑th‑percentile gap (page_p75_gap).
+
+xy_cut_region() (recursive) receives those two numbers as positional‑only
+parameters:
+
+python
+Copy
+segs = xy_cut_region(idx, rows, page_w, page_h, tbl_boxes,
+                     page_abs_thr=page_abs_thr,
+                     page_p75_gap=page_p75_gap)
+Every recursive call re‑uses the same pair unchanged:
+
+python
+Copy
+#                   ⬇ forwarded verbatim ⬇
+xy_cut_region(child_idx, lines, page_w, page_h, tbl_boxes,
+              page_abs_thr=page_abs_thr,
+              page_p75_gap=page_p75_gap)
+Any decision that asks “is this a large vertical gap?” is therefore
+evaluated against page‑wide statistics, even when the current region
+is only (say) the right‑hand column of a two‑column page.
+
+Why this is a problem
+In a narrow sub‑region the distribution of baseline‑to‑baseline distances is
+usually tighter than for the whole page.
+
+Using the much looser page thresholds inside that sub‑region suppresses
+legitimate cut points, so two paragraphs may get glued together or gaps
+may fail to qualify for the “big‑enough” rule (your “Anthropomorphism …”
+example).
+
+Fix: compute local thresholds on‑the‑fly
