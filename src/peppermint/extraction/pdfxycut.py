@@ -888,7 +888,7 @@ def extract_images_from_page(page: fitz.Page) -> list[dict]:
                 ],
                 "width":  width,
                 "height": height,
-                "text":   pixmap_base64(doc, xref),
+                "text": "[IMAGE]"  # pixmap_base64(doc, xref),
             })
 
     return img_blocks

@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+src/peppermint/data/*.pdf
+src/peppermint/data/*.xlsx
+src/peppermint/data/*.pptx
+src/peppermint/data/*.docx
