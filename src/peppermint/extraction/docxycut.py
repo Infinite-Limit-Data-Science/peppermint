@@ -97,6 +97,13 @@ def _section_props(section):
         numCols, gapTwip, colW_twip
     )
 
+def _with_page_bbox(block: dict, pgW: float, pgH: float) -> dict:
+    block["page_x0"] = 0.0
+    block["page_y0"] = 0.0
+    block["page_x1"] = float(pgW)
+    block["page_y1"] = float(pgH)
+    return block
+
 def extract_rows_from_docx(path):
     doc = Document(path)
 
@@ -162,15 +169,17 @@ def extract_rows_from_docx(path):
             x1 = x0 + colW_tw*TWIP_TO_PT
             y1 = y0 + tbl_h
 
-            pages[-1]["blocks"].append({
-                "page":    pages[-1]["page"],
-                "column":  col_idx,
-                "type":    "table",
-                "row_cnt": row_cnt,
-                "col_cnt": col_cnt,
-                "rows":    rows,
-                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-            })
+            pages[-1]["blocks"].append(
+                _with_page_bbox({
+                    "page":    pages[-1]["page"],
+                    "column":  col_idx,
+                    "type":    "table",
+                    "row_cnt": row_cnt,
+                    "col_cnt": col_cnt,
+                    "rows":    rows,
+                    "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                }, pgW, pgH)
+            )
             y_cursor += tbl_h
             continue
 
@@ -237,16 +246,18 @@ def extract_rows_from_docx(path):
                 x1 = left + (col_idx-1)*(colW_tw*TWIP_TO_PT + gapTw*TWIP_TO_PT) + colW_tw*TWIP_TO_PT - indent_right
                 y1 = y0 + (est_lines * line_h)
 
-                pages[-1]["blocks"].append({
-                    "page":    pages[-1]["page"],
-                    "column":  col_idx,
-                    "type":    "text",
-                    "text":    txt,
-                    "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                    "font_size": font_pt,
-                    "baseline": y1,
-                    "is_bullet_only": bool(bullet_only and not payload)
-                })
+                pages[-1]["blocks"].append(
+                    _with_page_bbox({
+                        "page":    pages[-1]["page"],
+                        "column":  col_idx,
+                        "type":    "text",
+                        "text":    txt,
+                        "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                        "font_size": font_pt,
+                        "baseline": y1,
+                        "is_bullet_only": bool(bullet_only and not payload)
+                    }, pgW, pgH)
+                )
                 y_cursor = (y1 - top) + space_after
 
             elif s_type == "image":

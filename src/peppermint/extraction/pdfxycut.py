@@ -57,13 +57,13 @@ def find_tables_fast(page) -> list[Any]:
     if native and native.tables:
         if DEBUG:
             import sys
-            print(f"[page {page.number+1}] native tables: {len(native.tables)}",
+            print(f"[page {page.number+1}] native tables: {len(native.tables)}",
                   file=sys.stderr)
-        return native.tables
+        return native.tables                    # ← best quality
 
     if DEBUG:
         import sys
-        print(f"[page {page.number+1}] native detector found nothing",
+        print(f"[page {page.number+1}] native detector found nothing",
               file=sys.stderr)
 
     hlines = _horiz_segments()
@@ -111,18 +111,23 @@ def find_tables_fast(page) -> list[Any]:
         print(f"   column starts ({len(col_starts)-1}): {col_starts[:-1]}",
               file=sys.stderr)
 
+    # ─── reject frames that are almost certainly NOT tables ────────────
+    # 1) only one real column detected   → looks like plain text
     if len(col_starts) <= 2:            # note: sentinel makes it 2
         if DEBUG:
             print("   only one inferred column → reject", file=sys.stderr)
         return []
 
+    # 2) top & bottom horizontals must span (almost) the same width
     EPS = 5.0
     same_span = abs(top[0] - bot[0]) <= EPS and abs(top[2] - bot[2]) <= EPS
     if not same_span:
         if DEBUG:
             print("   frame edges have different spans → reject", file=sys.stderr)
         return []
+    # -------------------------------------------------------------------
     
+    # build rows
     rows_map = {}
     for w in words:
         mid_y = round(w[1], 1)
@@ -163,6 +168,12 @@ def tight_bbox_from_cells(t: "fitz.Table") -> tuple[float, float, float, float]:
     return min(xs0), min(ys0), max(xs1), max(ys1)
 
 def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
+    """
+    1. Try the native PyMuPDF extractor (works for *true* fitz.Table).
+    2. If that fails we rebuild the rows from the words that fall
+       inside tbl.bbox - this also works for the pseudo-tables the
+       fallback detector creates.
+    """
     try:
         return tbl.extract()
     except Exception:
@@ -194,7 +205,11 @@ def rows_from_table(page: fitz.Page, tbl: "fitz.Table") -> list[list[str]]:
     split_on = re.compile(r'\s{2,}')
     return [split_on.split(" ".join(r).strip()) for r in rows]
 
-def compress_columns(rows, min_populated=2):
+def _compress_columns(rows, min_populated=2):
+    """
+    Remove columns that have fewer than `min_populated` non-empty cells.
+    Returns a new list of rows.
+    """
     if not rows:
         return rows
 
@@ -215,149 +230,9 @@ def compress_columns(rows, min_populated=2):
     new_rows = [r for r in new_rows if any(cell and str(cell).strip() for cell in r)]
     return new_rows
 
-
-def _split_cell(cell: str | None) -> list[str]:
-    if not cell:
-        return [""]
-    return [p.strip() for p in re.split(r"[\r\n]+", str(cell)) if p.strip()]
-
-ANCHOR_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+")
-NUM_RE    = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
-WS_RE     = re.compile(r"\s{2,}|[\r\n]+")
-
-def _tokenise(cell: str | None) -> list[str]:
-    if not cell:
-        return []
-    return [t.strip() for t in WS_RE.split(cell) if t.strip()]
-
-def _expand_rows(rows: list[list[str | None]]) -> list[list[str | None]]:
-    """
-    Turn any embedded line‑breaks / double‑spaces into separate physical rows,
-    keeping the table rectangular.
-    """
-    if not rows:
-        return rows
-
-    header, body = rows[0], rows[1:]
-    col_n        = len(header)
-    out          = [header]
-
-    for raw in body:
-        cols = [(c or "") for c in raw] + [""] * (col_n - len(raw))
-        tokens_per_col = [_tokenise(c) or [""] for c in cols]
-        max_len = max(len(t) for t in tokens_per_col)
-
-        for j, toks in enumerate(tokens_per_col):
-            if len(toks) < max_len:
-                toks.extend([""] * (max_len - len(toks)))
-
-        for i in range(max_len):
-            out.append([tokens_per_col[j][i] if i < len(tokens_per_col[j]) else ""
-                        for j in range(col_n)])
-    return out
-
-def _normalise_rows(rows: list[list[str | None]]) -> list[list[str | None]]:
-    """
-    • Detect anchor column (= most frequently *ANCHOR_RE*).
-    • Build item rows whenever that anchor column holds a value.
-    • Merge wrap‑around lines (anchor empty, not a summary).
-    • Append summary rows (= anchor empty & right‑most cell numeric & ≤2 cells).
-    • Stop when first non‑summary line is found *after* summary section.
-    """
-    if not rows: 
-        return rows
-
-    header, body = rows[0], rows[1:]
-    col_n        = len(header)
-
-    # 1. anchor column = column with most anchor‑like numbers
-    hits = [0]*col_n
-    for r in body:
-        for j,c in enumerate(r):
-            if c and ANCHOR_RE.fullmatch(c.strip()):
-                hits[j] += 1
-    anchor = hits.index(max(hits)) if any(hits) else 0
-
-    clean : list[list[str|None]] = [header]
-    in_summary = False
-
-    for raw in body:
-        row = [(c or "").strip() for c in raw] + [""]*(col_n-len(raw))
-        anchor_val = row[anchor]
-
-        non_empty  = [j for j,c in enumerate(row) if c]
-        right_num  = bool(non_empty and NUM_RE.fullmatch(row[non_empty[-1]]))
-        is_anchor  = bool(ANCHOR_RE.fullmatch(anchor_val))
-        is_summary = (not anchor_val and right_num and len(non_empty)<=2)
-
-        # ---- termination rule ----
-        if in_summary and not is_summary:
-            break        # anything after the summary section is outside the table
-
-        if is_anchor:                    # new item row
-            clean.append([c or None for c in row])
-        elif is_summary:                 # first or subsequent summary row
-            clean.append([c or None for c in row])
-            in_summary = True
-        else:                            # continuation line → merge
-            if len(clean) == 1:          # stray line before first anchor; skip
-                continue
-            prev = clean[-1]
-            for j,c in enumerate(row):
-                if c:
-                    sep = " " if prev[j] else ""
-                    prev[j] = (prev[j] or "") + sep + c
-
-    return clean
-
-def merge_wraps(rows: list[list[str | None]]) -> list[list[str | None]]:
-    if not rows:
-        return rows
-
-    header, body = rows[0], rows[1:]
-    col_n = len(header)
-
-    num_hits = [0] * col_n
-    for r in body:
-        for j, c in enumerate(r):
-            if c is not None and NUM_RE.match(str(c)):
-                num_hits[j] += 1
-    anchor = num_hits.index(max(num_hits)) if any(num_hits) else 0
-
-    merged: list[list[str | None]] = [header]
-
-    for raw in body:
-        row = [(c if c is not None else "") for c in raw] + [""] * (col_n - len(raw))
-
-        anchor_val     = row[anchor]
-        non_empty_idx  = [j for j, c in enumerate(row) if c.strip()]
-        rightmost_num  = max((j for j in non_empty_idx if NUM_RE.match(row[j])), default=-1)
-
-        is_anchor_num  = bool(NUM_RE.match(anchor_val))
-        looks_summary  = (not anchor_val.strip()
-                          and len(non_empty_idx) <= 2
-                          and rightmost_num == col_n - 1)
-
-        if is_anchor_num or looks_summary or len(merged) == 1:
-            merged.append(row)
-        else:
-            prev = merged[-1]
-            for j, c in enumerate(row):
-                if c.strip():
-                    prev[j] = (prev[j] or "") + (" " if prev[j] else "") + c
-                    prev[j] = prev[j].strip()
-
-    for r in merged:
-        for j, c in enumerate(r):
-            if c == "":
-                r[j] = None
-
-    return merged
-
 def table_feature_dict(page: fitz.Page, tbl: "fitz.Table", pno: int) -> dict:
     rows = rows_from_table(page, tbl)
-    rows = _expand_rows(rows)
-    rows = _normalise_rows(rows)
+    rows = _compress_columns(rows, min_populated=2)
     
     return {
         "type":    "table",
@@ -373,6 +248,27 @@ def in_any_table(x0, y0, x1, y1, tbl_boxes):
     cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
     return any(x0b <= cx <= x1b and y0b <= cy <= y1b for
                x0b, y0b, x1b, y1b in tbl_boxes)
+
+
+def table_feature_dict(page: fitz.Page, tbl: "fitz.Table", pno: int) -> dict:
+    rows = rows_from_table(page, tbl)
+    rows = _compress_columns(rows, min_populated=2)
+    
+    return {
+        "type":    "table",
+        "page":    pno + 1,
+        "bbox":    [round(v, 2) for v in tbl.bbox],
+        "row_cnt": len(rows),
+        "col_cnt": max((len(r) for r in rows), default=0),
+        "rows":    rows,
+        "text":    ""
+    }
+
+def in_any_table(x0, y0, x1, y1, tbl_boxes):
+    cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+    return any(x0b <= cx <= x1b and y0b <= cy <= y1b for
+               x0b, y0b, x1b, y1b in tbl_boxes)
+
 
 def add_page_bbox(block: dict, page_rect) -> dict:
     block["page_x0"] = float(page_rect.x0)
